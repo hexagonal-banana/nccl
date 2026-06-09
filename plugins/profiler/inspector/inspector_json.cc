@@ -1,5 +1,6 @@
 #include "inspector_json.h"
 #include "inspector_ring.h"
+#include "profiler.h"
 
 #include <unistd.h>
 #include <vector>
@@ -257,6 +258,105 @@ static inline inspectorResult_t inspectorCompletedP2p(jsonFileOutput* jfo,
   return inspectorSuccess;
 }
 
+static const char* inspectorProxyEventTypeToString(inspectorProxyEventType_t type) {
+  switch (type) {
+  case inspectorProxyEventTypeOp: return "ProxyOp";
+  case inspectorProxyEventTypeStep: return "ProxyStep";
+  case inspectorProxyEventTypeCtrl: return "ProxyCtrl";
+  default: return "Unknown";
+  }
+}
+
+static const char* inspectorProxyEventStateToString(int state) {
+  switch ((ncclProfilerEventState_t)state) {
+  case ncclProfilerProxyOpSendPosted: return "ProxyOpSendPosted";
+  case ncclProfilerProxyOpSendRemFifoWait: return "ProxyOpSendRemFifoWait";
+  case ncclProfilerProxyOpSendTransmitted: return "ProxyOpSendTransmitted";
+  case ncclProfilerProxyOpSendDone: return "ProxyOpSendDone";
+  case ncclProfilerProxyOpRecvPosted: return "ProxyOpRecvPosted";
+  case ncclProfilerProxyOpRecvReceived: return "ProxyOpRecvReceived";
+  case ncclProfilerProxyOpRecvTransmitted: return "ProxyOpRecvTransmitted";
+  case ncclProfilerProxyOpRecvDone: return "ProxyOpRecvDone";
+  case ncclProfilerProxyOpInProgress_v4: return "ProxyOpInProgress";
+  case ncclProfilerProxyStepSendGPUWait: return "ProxyStepSendGPUWait";
+  case ncclProfilerProxyStepSendPeerWait_v4: return "ProxyStepSendPeerWait";
+  case ncclProfilerProxyStepSendWait: return "ProxyStepSendWait";
+  case ncclProfilerProxyStepRecvWait: return "ProxyStepRecvWait";
+  case ncclProfilerProxyStepRecvFlushWait: return "ProxyStepRecvFlushWait";
+  case ncclProfilerProxyStepRecvGPUWait: return "ProxyStepRecvGPUWait";
+  case ncclProfilerProxyCtrlIdle: return "ProxyCtrlIdle";
+  case ncclProfilerProxyCtrlActive: return "ProxyCtrlActive";
+  case ncclProfilerProxyCtrlSleep: return "ProxyCtrlSleep";
+  case ncclProfilerProxyCtrlWakeup: return "ProxyCtrlWakeup";
+  case ncclProfilerProxyCtrlAppend: return "ProxyCtrlAppend";
+  case ncclProfilerProxyCtrlAppendEnd: return "ProxyCtrlAppendEnd";
+  default: return "Unknown";
+  }
+}
+
+static const char* inspectorProxyDirectionToString(int isSend) {
+  if (isSend == 1) return "Send";
+  if (isSend == 0) return "Recv";
+  return "Unknown";
+}
+
+static inline inspectorResult_t inspectorCompletedProxy(jsonFileOutput* jfo,
+                                                        const struct inspectorCompletedProxyEventInfo* proxy) {
+  JSON_CHK(jsonStartObject(jfo));
+  {
+    JSON_CHK(jsonKey(jfo, "proxy_type")); JSON_CHK(jsonStr(jfo, inspectorProxyEventTypeToString(proxy->proxyType)));
+
+    JSON_CHK(jsonKey(jfo, "proxy_id")); JSON_CHK(jsonUint64(jfo, proxy->proxyId));
+
+    JSON_CHK(jsonKey(jfo, "proxy_rank")); JSON_CHK(jsonInt(jfo, proxy->rank));
+
+    JSON_CHK(jsonKey(jfo, "proxy_pid")); JSON_CHK(jsonInt(jfo, proxy->pid));
+
+    JSON_CHK(jsonKey(jfo, "proxy_start_ts")); JSON_CHK(jsonUint64(jfo, proxy->tsStartUsec));
+
+    JSON_CHK(jsonKey(jfo, "proxy_stop_ts")); JSON_CHK(jsonUint64(jfo, proxy->tsCompletedUsec));
+
+    uint64_t durationUsec =
+      (proxy->tsCompletedUsec >= proxy->tsStartUsec) ?
+      (proxy->tsCompletedUsec - proxy->tsStartUsec) : 0;
+    JSON_CHK(jsonKey(jfo, "proxy_duration_us")); JSON_CHK(jsonUint64(jfo, durationUsec));
+
+    if (proxy->proxyType == inspectorProxyEventTypeOp ||
+        proxy->proxyType == inspectorProxyEventTypeStep) {
+      JSON_CHK(jsonKey(jfo, "proxy_direction")); JSON_CHK(jsonStr(jfo, inspectorProxyDirectionToString(proxy->isSend)));
+      JSON_CHK(jsonKey(jfo, "proxy_channel_id")); JSON_CHK(jsonInt(jfo, proxy->channelId));
+      JSON_CHK(jsonKey(jfo, "proxy_peer")); JSON_CHK(jsonInt(jfo, proxy->peer));
+      JSON_CHK(jsonKey(jfo, "proxy_n_steps")); JSON_CHK(jsonInt(jfo, proxy->nSteps));
+      JSON_CHK(jsonKey(jfo, "proxy_chunk_size")); JSON_CHK(jsonInt(jfo, proxy->chunkSize));
+      JSON_CHK(jsonKey(jfo, "proxy_trans_size")); JSON_CHK(jsonUint64(jfo, proxy->transSize));
+    }
+
+    if (proxy->proxyType == inspectorProxyEventTypeStep) {
+      JSON_CHK(jsonKey(jfo, "proxy_step")); JSON_CHK(jsonInt(jfo, proxy->step));
+    }
+
+    JSON_CHK(jsonKey(jfo, "proxy_states"));
+    JSON_CHK(jsonStartList(jfo));
+    for (uint32_t i = 0; i < proxy->nStates; i++) {
+      JSON_CHK(jsonStartObject(jfo));
+      JSON_CHK(jsonKey(jfo, "state")); JSON_CHK(jsonStr(jfo, inspectorProxyEventStateToString(proxy->states[i].state)));
+      JSON_CHK(jsonKey(jfo, "state_id")); JSON_CHK(jsonInt(jfo, proxy->states[i].state));
+      JSON_CHK(jsonKey(jfo, "state_ts")); JSON_CHK(jsonUint64(jfo, proxy->states[i].tsUsec));
+      if (proxy->states[i].transSize != 0) {
+        JSON_CHK(jsonKey(jfo, "trans_size")); JSON_CHK(jsonUint64(jfo, proxy->states[i].transSize));
+      }
+      if (proxy->states[i].appendedProxyOps != 0) {
+        JSON_CHK(jsonKey(jfo, "appended_proxy_ops")); JSON_CHK(jsonInt(jfo, proxy->states[i].appendedProxyOps));
+      }
+      JSON_CHK(jsonFinishObject(jfo));
+    }
+    JSON_CHK(jsonFinishList(jfo));
+  }
+  JSON_CHK(jsonFinishObject(jfo));
+
+  return inspectorSuccess;
+}
+
 
 /*
  * Description:
@@ -369,6 +469,51 @@ static inspectorResult_t inspectorCommInfoDumpP2p(jsonFileOutput* jfo,
   return inspectorSuccess;
 }
 
+static inspectorResult_t inspectorCommInfoDumpProxy(jsonFileOutput* jfo,
+                                                    inspectorCommInfo* commInfo,
+                                                    bool* needs_writing) {
+  if (commInfo == nullptr) {
+    return inspectorSuccess;
+  }
+
+  thread_local std::vector<inspectorCompletedProxyEventInfo> drainedProxy;
+  drainedProxy.clear();
+
+  inspectorLockWr(&commInfo->guard);
+  if (commInfo->dump_proxy) {
+    if (commInfo->completedProxyRing.size > 0
+        && drainedProxy.capacity() < commInfo->completedProxyRing.size) {
+      drainedProxy.reserve(commInfo->completedProxyRing.size);
+    }
+    INS_CHK(inspectorRingDrain<inspectorCompletedProxyEventInfo>(&commInfo->completedProxyRing,
+                                                                 drainedProxy));
+    commInfo->dump_proxy = inspectorRingNonEmpty(&commInfo->completedProxyRing);
+  }
+  inspectorUnlockRWLock(&commInfo->guard);
+
+  if (!drainedProxy.empty()) {
+    *needs_writing = true;
+    JSON_CHK(jsonLockOutput(jfo));
+    for (size_t i = 0; i < drainedProxy.size(); i++) {
+      JSON_CHK(jsonStartObject(jfo));
+      {
+        JSON_CHK(jsonKey(jfo, "header"));
+        inspectorCommInfoHeader(jfo, commInfo);
+
+        JSON_CHK(jsonKey(jfo, "metadata"));
+        inspectorCommInfoMetaHeader(jfo);
+
+        JSON_CHK(jsonKey(jfo, "proxy_event"));
+        INS_CHK(inspectorCompletedProxy(jfo, &drainedProxy[i]));
+      }
+      JSON_CHK(jsonFinishObject(jfo));
+      JSON_CHK(jsonNewline(jfo));
+    }
+    JSON_CHK(jsonUnlockOutput(jfo));
+  }
+  return inspectorSuccess;
+}
+
 static inspectorResult_t inspectorCommInfoDump(jsonFileOutput* jfo,
                                                inspectorCommInfo* commInfo,
                                                bool* needs_writing) {
@@ -376,6 +521,7 @@ static inspectorResult_t inspectorCommInfoDump(jsonFileOutput* jfo,
 
   INS_CHK(inspectorCommInfoDumpColl(jfo, commInfo, needs_writing));
   INS_CHK(inspectorCommInfoDumpP2p(jfo, commInfo, needs_writing));
+  INS_CHK(inspectorCommInfoDumpProxy(jfo, commInfo, needs_writing));
   return inspectorSuccess;
 }
 

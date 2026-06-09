@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <vector>
 
 #include "json.h"
@@ -19,6 +20,7 @@
 #include "version.h"
 
 #define MAX_CHANNELS                     64
+#define MAX_PROXY_EVENT_STEPS           8
 
 // Bump when ncclProfiler_t alias changes to a new interface version.
 #define NCCL_PROFILER_INTERFACE_VERSION 5
@@ -156,6 +158,37 @@ struct inspectorCompletedOpInfo {
   struct inspectorEventTrkOpInfo evtTrk;
 };
 
+typedef enum {
+  inspectorProxyEventTypeOp = 0,
+  inspectorProxyEventTypeStep = 1,
+  inspectorProxyEventTypeCtrl = 2,
+} inspectorProxyEventType_t;
+
+struct inspectorProxyEventStateInfo {
+  int state;
+  uint64_t tsUsec;
+  size_t transSize;
+  int appendedProxyOps;
+};
+
+struct inspectorCompletedProxyEventInfo {
+  inspectorProxyEventType_t proxyType;
+  uint64_t proxyId;
+  int rank;
+  pid_t pid;
+  uint8_t channelId;
+  int peer;
+  int nSteps;
+  int chunkSize;
+  int isSend;
+  int step;
+  size_t transSize;
+  uint64_t tsStartUsec;
+  uint64_t tsCompletedUsec;
+  uint32_t nStates;
+  struct inspectorProxyEventStateInfo states[MAX_PROXY_EVENT_STEPS];
+};
+
 #include "inspector_ring.h"
 
 enum {
@@ -178,9 +211,12 @@ struct inspectorCommInfo {
 
   bool dump_coll;
   bool dump_p2p;
+  bool dump_proxy;
   struct inspectorCompletedRing completedCollRing;
   struct inspectorCompletedRing completedP2pRing;
+  struct inspectorCompletedRing completedProxyRing;
   uint64_t p2pSeqNum;
+  uint64_t proxySeqNum;
   pthread_rwlock_t guard;
 };
 
@@ -271,6 +307,55 @@ struct inspectorP2pInfo {
   int peer;
 };
 
+struct inspectorProxyOpInfo {
+  uint64_t type;
+  int refCount;
+  bool stopped;
+  bool enqueued;
+  struct inspectorCommInfo *commInfo;
+  uint64_t proxyId;
+  int rank;
+  pid_t pid;
+  uint8_t channelId;
+  int peer;
+  int nSteps;
+  int chunkSize;
+  int isSend;
+  size_t transSize;
+  uint64_t tsStartUsec;
+  uint64_t tsCompletedUsec;
+  uint32_t nStates;
+  struct inspectorProxyEventStateInfo states[MAX_PROXY_EVENT_STEPS];
+  pthread_rwlock_t guard;
+};
+
+struct inspectorProxyStepInfo {
+  uint64_t type;
+  struct inspectorCommInfo *commInfo;
+  struct inspectorProxyOpInfo *parent;
+  uint64_t proxyId;
+  int rank;
+  int step;
+  int isSend;
+  size_t transSize;
+  uint64_t tsStartUsec;
+  uint64_t tsCompletedUsec;
+  uint32_t nStates;
+  struct inspectorProxyEventStateInfo states[MAX_PROXY_EVENT_STEPS];
+  pthread_rwlock_t guard;
+};
+
+struct inspectorProxyCtrlInfo {
+  uint64_t type;
+  struct inspectorCommInfo *commInfo;
+  uint64_t proxyId;
+  uint64_t tsStartUsec;
+  uint64_t tsCompletedUsec;
+  uint32_t nStates;
+  struct inspectorProxyEventStateInfo states[MAX_PROXY_EVENT_STEPS];
+  pthread_rwlock_t guard;
+};
+
 struct inspectorCommInfoList {
   struct inspectorCommInfo* comms;
   uint32_t ncomms;
@@ -323,6 +408,8 @@ inline int ncclTypeSize(ncclDataType_t type) {
 
 // Global flag to control P2P tracking
 extern bool enableNcclInspectorP2p;
+// Global flag to control proxy event tracking
+extern bool enableNcclInspectorProxy;
 extern bool requireKernelTiming;
 // Minimum message size (bytes) to be `tracked by inspector
 extern size_t ncclInspectorDumpMinSizeBytes;

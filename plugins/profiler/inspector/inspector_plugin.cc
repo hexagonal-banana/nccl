@@ -133,6 +133,9 @@ __hidden ncclResult_t inspectorPluginInit(void** context, uint64_t commHash,
   if (enableNcclInspectorP2p) {
     *eActivationMask |= ncclProfileP2p;
   }
+  if (enableNcclInspectorProxy) {
+    *eActivationMask |= ncclProfileProxyOp | ncclProfileProxyStep | ncclProfileProxyCtrl;
+  }
 
   INFO(NCCL_INIT, "PROFILER/Plugin: init commName: %s commHash: %lu nranks: %d rank: %d",
        commName ? commName : "", commHash, nranks, rank);
@@ -201,6 +204,14 @@ static void inspectorUpdateCommOpInfo(struct inspectorCommInfo *commInfo,
   inspectorUnlockRWLock(&commInfo->guard);
 }
 
+static void inspectorUpdateCommProxyInfo(struct inspectorCommInfo *commInfo,
+                                         struct inspectorCompletedProxyEventInfo *completedProxy) {
+  inspectorLockWr(&commInfo->guard);
+  inspectorRingEnqueue(&commInfo->completedProxyRing, completedProxy);
+  commInfo->dump_proxy = inspectorRingNonEmpty(&commInfo->completedProxyRing);
+  inspectorUnlockRWLock(&commInfo->guard);
+}
+
 inspectorResult_t inspectorPluginP2pInfoRef(struct inspectorP2pInfo *p2pInfo) {
   p2pInfo->refCount += 1;
   return inspectorSuccess;
@@ -217,6 +228,218 @@ inspectorResult_t inspectorPluginP2pInfoDeRef(struct inspectorP2pInfo *p2pInfo) 
 static void inspectorPluginP2pInfoCleanup(struct inspectorP2pInfo *p2pInfo) {
   inspectorLockDestroy(&p2pInfo->guard);
   inspectorEventPoolReleaseP2p(p2pInfo);
+}
+
+static void inspectorRecordProxyEventState(struct inspectorProxyEventStateInfo* states,
+                                           uint32_t* nStates,
+                                           ncclProfilerEventState_t eState,
+                                           ncclProfilerEventStateArgs_t* eStateArgs) {
+  if (states == nullptr || nStates == nullptr || *nStates >= MAX_PROXY_EVENT_STEPS) {
+    return;
+  }
+
+  struct inspectorProxyEventStateInfo* state = &states[(*nStates)++];
+  state->state = (int)eState;
+  state->tsUsec = inspectorGetTime();
+  state->transSize = 0;
+  state->appendedProxyOps = 0;
+
+  switch (eState) {
+  case ncclProfilerProxyStepSendWait:
+  case ncclProfilerProxyStepRecvFlushWait:
+    if (eStateArgs != nullptr) {
+      state->transSize = eStateArgs->proxyStep.transSize;
+    }
+    break;
+  case ncclProfilerProxyStepSendGPUWait:
+  case ncclProfilerProxyStepSendPeerWait_v4:
+  case ncclProfilerProxyStepRecvWait:
+  case ncclProfilerProxyStepRecvGPUWait:
+    break;
+  case ncclProfilerProxyCtrlIdle:
+  case ncclProfilerProxyCtrlActive:
+  case ncclProfilerProxyCtrlSleep:
+  case ncclProfilerProxyCtrlWakeup:
+  case ncclProfilerProxyCtrlAppend:
+  case ncclProfilerProxyCtrlAppendEnd:
+    if (eStateArgs != nullptr) {
+      state->appendedProxyOps = eStateArgs->proxyCtrl.appendedProxyOps;
+    }
+    break;
+  default:
+    break;
+  }
+}
+
+static void inspectorCompletedProxyFromOpLocked(struct inspectorCompletedProxyEventInfo *completedProxy,
+                                                struct inspectorProxyOpInfo *opInfo) {
+  memset(completedProxy, 0, sizeof(*completedProxy));
+  completedProxy->proxyType = inspectorProxyEventTypeOp;
+  completedProxy->proxyId = opInfo->proxyId;
+  completedProxy->rank = opInfo->rank;
+  completedProxy->pid = opInfo->pid;
+  completedProxy->channelId = opInfo->channelId;
+  completedProxy->peer = opInfo->peer;
+  completedProxy->nSteps = opInfo->nSteps;
+  completedProxy->chunkSize = opInfo->chunkSize;
+  completedProxy->isSend = opInfo->isSend;
+  completedProxy->step = -1;
+  completedProxy->transSize = opInfo->transSize;
+  completedProxy->tsStartUsec = opInfo->tsStartUsec;
+  completedProxy->tsCompletedUsec = opInfo->tsCompletedUsec;
+  completedProxy->nStates = opInfo->nStates;
+  memcpy(completedProxy->states, opInfo->states,
+         sizeof(opInfo->states[0]) * opInfo->nStates);
+}
+
+static void inspectorCompletedProxyFromStepLocked(struct inspectorCompletedProxyEventInfo *completedProxy,
+                                                  struct inspectorProxyStepInfo *stepInfo) {
+  memset(completedProxy, 0, sizeof(*completedProxy));
+  completedProxy->proxyType = inspectorProxyEventTypeStep;
+  completedProxy->proxyId = stepInfo->proxyId;
+  completedProxy->rank = stepInfo->rank;
+  completedProxy->pid = stepInfo->parent ? stepInfo->parent->pid : getpid();
+  completedProxy->channelId = stepInfo->parent ? stepInfo->parent->channelId : 0;
+  completedProxy->peer = stepInfo->parent ? stepInfo->parent->peer : -1;
+  completedProxy->nSteps = stepInfo->parent ? stepInfo->parent->nSteps : 0;
+  completedProxy->chunkSize = stepInfo->parent ? stepInfo->parent->chunkSize : 0;
+  completedProxy->isSend = stepInfo->isSend;
+  completedProxy->step = stepInfo->step;
+  completedProxy->transSize = stepInfo->transSize;
+  completedProxy->tsStartUsec = stepInfo->tsStartUsec;
+  completedProxy->tsCompletedUsec = stepInfo->tsCompletedUsec;
+  completedProxy->nStates = stepInfo->nStates;
+  memcpy(completedProxy->states, stepInfo->states,
+         sizeof(stepInfo->states[0]) * stepInfo->nStates);
+}
+
+static void inspectorCompletedProxyFromCtrlLocked(struct inspectorCompletedProxyEventInfo *completedProxy,
+                                                  struct inspectorProxyCtrlInfo *ctrlInfo) {
+  memset(completedProxy, 0, sizeof(*completedProxy));
+  completedProxy->proxyType = inspectorProxyEventTypeCtrl;
+  completedProxy->proxyId = ctrlInfo->proxyId;
+  completedProxy->rank = ctrlInfo->commInfo ? ctrlInfo->commInfo->rank : -1;
+  completedProxy->pid = getpid();
+  completedProxy->channelId = 0;
+  completedProxy->peer = -1;
+  completedProxy->nSteps = 0;
+  completedProxy->chunkSize = 0;
+  completedProxy->isSend = -1;
+  completedProxy->step = -1;
+  completedProxy->transSize = 0;
+  completedProxy->tsStartUsec = ctrlInfo->tsStartUsec;
+  completedProxy->tsCompletedUsec = ctrlInfo->tsCompletedUsec;
+  completedProxy->nStates = ctrlInfo->nStates;
+  memcpy(completedProxy->states, ctrlInfo->states,
+         sizeof(ctrlInfo->states[0]) * ctrlInfo->nStates);
+}
+
+static void inspectorPluginProxyOpInfoCleanup(struct inspectorProxyOpInfo *opInfo) {
+  inspectorLockDestroy(&opInfo->guard);
+  free(opInfo);
+}
+
+static void inspectorPluginProxyStepInfoCleanup(struct inspectorProxyStepInfo *stepInfo) {
+  inspectorLockDestroy(&stepInfo->guard);
+  free(stepInfo);
+}
+
+static void inspectorPluginProxyCtrlInfoCleanup(struct inspectorProxyCtrlInfo *ctrlInfo) {
+  inspectorLockDestroy(&ctrlInfo->guard);
+  free(ctrlInfo);
+}
+
+static void inspectorPluginProxyOpMaybeCompleteLocked(struct inspectorProxyOpInfo *opInfo,
+                                                      struct inspectorCompletedProxyEventInfo *completedProxy,
+                                                      struct inspectorCommInfo **commInfo,
+                                                      bool *doCommUpdate,
+                                                      bool *needsCleanup) {
+  if (opInfo->stopped && opInfo->refCount == 0 && !opInfo->enqueued) {
+    opInfo->enqueued = true;
+    inspectorCompletedProxyFromOpLocked(completedProxy, opInfo);
+    *commInfo = opInfo->commInfo;
+    *doCommUpdate = (*commInfo != nullptr);
+    *needsCleanup = true;
+  }
+}
+
+static void inspectorPluginProxyOpInfoInit(struct inspectorProxyOpInfo **opInfo,
+                                           ncclProfilerEventDescr_t *eDescr,
+                                           struct inspectorCommInfo *commInfo) {
+  struct inspectorProxyOpInfo *opInfoPtr =
+    (struct inspectorProxyOpInfo*)calloc(1, sizeof(struct inspectorProxyOpInfo));
+  if (opInfoPtr == nullptr) {
+    INFO_INSPECTOR("Inspector: Failed to allocate memory for proxy op info structure");
+    *opInfo = nullptr;
+    return;
+  }
+
+  opInfoPtr->type = ncclProfileProxyOp;
+  opInfoPtr->refCount = 1;
+  opInfoPtr->commInfo = commInfo;
+  opInfoPtr->proxyId = __atomic_add_fetch(&commInfo->proxySeqNum, 1, __ATOMIC_RELAXED);
+  opInfoPtr->rank = eDescr->rank;
+  opInfoPtr->pid = eDescr->proxyOp.pid;
+  opInfoPtr->channelId = eDescr->proxyOp.channelId;
+  opInfoPtr->peer = eDescr->proxyOp.peer;
+  opInfoPtr->nSteps = eDescr->proxyOp.nSteps;
+  opInfoPtr->chunkSize = eDescr->proxyOp.chunkSize;
+  opInfoPtr->isSend = eDescr->proxyOp.isSend;
+  opInfoPtr->tsStartUsec = inspectorGetTime();
+  inspectorLockInit(&opInfoPtr->guard);
+  *opInfo = opInfoPtr;
+}
+
+static void inspectorPluginProxyStepInfoInit(struct inspectorProxyStepInfo **stepInfo,
+                                             ncclProfilerEventDescr_t *eDescr,
+                                             struct inspectorCommInfo *commInfo) {
+  struct inspectorProxyStepInfo *stepInfoPtr =
+    (struct inspectorProxyStepInfo*)calloc(1, sizeof(struct inspectorProxyStepInfo));
+  if (stepInfoPtr == nullptr) {
+    INFO_INSPECTOR("Inspector: Failed to allocate memory for proxy step info structure");
+    *stepInfo = nullptr;
+    return;
+  }
+
+  struct inspectorProxyOpInfo *parent = nullptr;
+  if (eDescr->parentObj != nullptr && *(uint64_t*)eDescr->parentObj == ncclProfileProxyOp) {
+    parent = (struct inspectorProxyOpInfo*)eDescr->parentObj;
+    inspectorLockWr(&parent->guard);
+    parent->refCount += 1;
+    stepInfoPtr->isSend = parent->isSend;
+    stepInfoPtr->commInfo = parent->commInfo;
+    inspectorUnlockRWLock(&parent->guard);
+  } else {
+    stepInfoPtr->isSend = -1;
+    stepInfoPtr->commInfo = commInfo;
+  }
+
+  stepInfoPtr->type = ncclProfileProxyStep;
+  stepInfoPtr->parent = parent;
+  stepInfoPtr->proxyId = __atomic_add_fetch(&commInfo->proxySeqNum, 1, __ATOMIC_RELAXED);
+  stepInfoPtr->rank = eDescr->rank;
+  stepInfoPtr->step = eDescr->proxyStep.step;
+  stepInfoPtr->tsStartUsec = inspectorGetTime();
+  inspectorLockInit(&stepInfoPtr->guard);
+  *stepInfo = stepInfoPtr;
+}
+
+static void inspectorPluginProxyCtrlInfoInit(struct inspectorProxyCtrlInfo **ctrlInfo,
+                                             struct inspectorCommInfo *commInfo) {
+  struct inspectorProxyCtrlInfo *ctrlInfoPtr =
+    (struct inspectorProxyCtrlInfo*)calloc(1, sizeof(struct inspectorProxyCtrlInfo));
+  if (ctrlInfoPtr == nullptr) {
+    INFO_INSPECTOR("Inspector: Failed to allocate memory for proxy ctrl info structure");
+    *ctrlInfo = nullptr;
+    return;
+  }
+
+  ctrlInfoPtr->type = ncclProfileProxyCtrl;
+  ctrlInfoPtr->commInfo = commInfo;
+  ctrlInfoPtr->proxyId = __atomic_add_fetch(&commInfo->proxySeqNum, 1, __ATOMIC_RELAXED);
+  ctrlInfoPtr->tsStartUsec = inspectorGetTime();
+  inspectorLockInit(&ctrlInfoPtr->guard);
+  *ctrlInfo = ctrlInfoPtr;
 }
 
 /*
@@ -503,6 +726,24 @@ __hidden ncclResult_t inspectorPluginStartEvent(void* context,
     struct inspectorKernelChInfo *kernelChEvent = nullptr;
     inspectorPluginKernelChInfoInit(&kernelChEvent, eDescr);
     *eHandle = kernelChEvent;
+  } else if (eDescr->type == ncclProfileProxyOp) {
+    if (!enableNcclInspectorProxy) return ncclSuccess;
+    struct inspectorProxyOpInfo *proxyOpEvent = nullptr;
+    struct inspectorCommInfo *commInfoCtx = (struct inspectorCommInfo*)context;
+    inspectorPluginProxyOpInfoInit(&proxyOpEvent, eDescr, commInfoCtx);
+    *eHandle = proxyOpEvent;
+  } else if (eDescr->type == ncclProfileProxyStep) {
+    if (!enableNcclInspectorProxy) return ncclSuccess;
+    struct inspectorProxyStepInfo *proxyStepEvent = nullptr;
+    struct inspectorCommInfo *commInfoCtx = (struct inspectorCommInfo*)context;
+    inspectorPluginProxyStepInfoInit(&proxyStepEvent, eDescr, commInfoCtx);
+    *eHandle = proxyStepEvent;
+  } else if (eDescr->type == ncclProfileProxyCtrl) {
+    if (!enableNcclInspectorProxy) return ncclSuccess;
+    struct inspectorProxyCtrlInfo *proxyCtrlEvent = nullptr;
+    struct inspectorCommInfo *commInfoCtx = (struct inspectorCommInfo*)context;
+    inspectorPluginProxyCtrlInfoInit(&proxyCtrlEvent, commInfoCtx);
+    *eHandle = proxyCtrlEvent;
   } else {
     return ncclSuccess;
   }
@@ -658,6 +899,84 @@ static ncclResult_t inspectorPluginStopEventKernelCh(struct inspectorKernelChInf
   return ncclSuccess;
 }
 
+static ncclResult_t inspectorPluginStopEventProxyOp(struct inspectorProxyOpInfo *opInfo) {
+  struct inspectorCompletedProxyEventInfo completedProxy;
+  struct inspectorCommInfo *commInfo = nullptr;
+  bool doCommUpdate = false;
+  bool needsCleanup = false;
+
+  inspectorLockWr(&opInfo->guard);
+  opInfo->tsCompletedUsec = inspectorGetTime();
+  opInfo->stopped = true;
+  opInfo->refCount -= 1;
+  inspectorPluginProxyOpMaybeCompleteLocked(opInfo, &completedProxy, &commInfo,
+                                            &doCommUpdate, &needsCleanup);
+  inspectorUnlockRWLock(&opInfo->guard);
+
+  if (doCommUpdate) {
+    inspectorUpdateCommProxyInfo(commInfo, &completedProxy);
+  }
+  if (needsCleanup) {
+    inspectorPluginProxyOpInfoCleanup(opInfo);
+  }
+  return ncclSuccess;
+}
+
+static ncclResult_t inspectorPluginStopEventProxyStep(struct inspectorProxyStepInfo *stepInfo) {
+  struct inspectorCompletedProxyEventInfo completedProxy;
+  struct inspectorCompletedProxyEventInfo completedOp;
+  struct inspectorCommInfo *commInfo = nullptr;
+  struct inspectorCommInfo *opCommInfo = nullptr;
+  bool doOpCommUpdate = false;
+  bool needsOpCleanup = false;
+
+  inspectorLockWr(&stepInfo->guard);
+  stepInfo->tsCompletedUsec = inspectorGetTime();
+  commInfo = stepInfo->commInfo;
+  inspectorCompletedProxyFromStepLocked(&completedProxy, stepInfo);
+  inspectorUnlockRWLock(&stepInfo->guard);
+
+  if (commInfo != nullptr) {
+    inspectorUpdateCommProxyInfo(commInfo, &completedProxy);
+  }
+
+  if (stepInfo->parent != nullptr) {
+    struct inspectorProxyOpInfo *parent = stepInfo->parent;
+    inspectorLockWr(&parent->guard);
+    parent->refCount -= 1;
+    inspectorPluginProxyOpMaybeCompleteLocked(parent, &completedOp, &opCommInfo,
+                                              &doOpCommUpdate, &needsOpCleanup);
+    inspectorUnlockRWLock(&parent->guard);
+
+    if (doOpCommUpdate) {
+      inspectorUpdateCommProxyInfo(opCommInfo, &completedOp);
+    }
+    if (needsOpCleanup) {
+      inspectorPluginProxyOpInfoCleanup(parent);
+    }
+  }
+
+  inspectorPluginProxyStepInfoCleanup(stepInfo);
+  return ncclSuccess;
+}
+
+static ncclResult_t inspectorPluginStopEventProxyCtrl(struct inspectorProxyCtrlInfo *ctrlInfo) {
+  struct inspectorCompletedProxyEventInfo completedProxy;
+  struct inspectorCommInfo *commInfo = nullptr;
+
+  inspectorLockWr(&ctrlInfo->guard);
+  ctrlInfo->tsCompletedUsec = inspectorGetTime();
+  commInfo = ctrlInfo->commInfo;
+  inspectorCompletedProxyFromCtrlLocked(&completedProxy, ctrlInfo);
+  inspectorUnlockRWLock(&ctrlInfo->guard);
+
+  if (commInfo != nullptr) {
+    inspectorUpdateCommProxyInfo(commInfo, &completedProxy);
+  }
+  inspectorPluginProxyCtrlInfoCleanup(ctrlInfo);
+  return ncclSuccess;
+}
+
 static ncclResult_t inspectorPluginRecordEventStateKernelChColl(struct inspectorKernelChInfo *kernelChInfo,
                                                                 struct inspectorCollInfo *collInfo,
                                                                 ncclProfilerEventStateArgs_t* eStateArgs) {
@@ -718,6 +1037,50 @@ static ncclResult_t inspectorPluginRecordEventStateKernelCh(struct inspectorKern
   return ncclSuccess;
 }
 
+static ncclResult_t inspectorPluginRecordEventStateProxyOp(struct inspectorProxyOpInfo *opInfo,
+                                                           ncclProfilerEventState_t eState,
+                                                           ncclProfilerEventStateArgs_t* eStateArgs) {
+  inspectorLockWr(&opInfo->guard);
+  inspectorRecordProxyEventState(opInfo->states, &opInfo->nStates, eState, eStateArgs);
+  inspectorUnlockRWLock(&opInfo->guard);
+  return ncclSuccess;
+}
+
+static bool inspectorProxyStepStateCarriesTransSize(ncclProfilerEventState_t eState) {
+  return eState == ncclProfilerProxyStepSendWait ||
+         eState == ncclProfilerProxyStepRecvFlushWait;
+}
+
+static ncclResult_t inspectorPluginRecordEventStateProxyStep(struct inspectorProxyStepInfo *stepInfo,
+                                                             ncclProfilerEventState_t eState,
+                                                             ncclProfilerEventStateArgs_t* eStateArgs) {
+  size_t transSize = 0;
+  if (eStateArgs != nullptr && inspectorProxyStepStateCarriesTransSize(eState)) {
+    transSize = eStateArgs->proxyStep.transSize;
+  }
+
+  inspectorLockWr(&stepInfo->guard);
+  inspectorRecordProxyEventState(stepInfo->states, &stepInfo->nStates, eState, eStateArgs);
+  stepInfo->transSize += transSize;
+  inspectorUnlockRWLock(&stepInfo->guard);
+
+  if (transSize != 0 && stepInfo->parent != nullptr) {
+    inspectorLockWr(&stepInfo->parent->guard);
+    stepInfo->parent->transSize += transSize;
+    inspectorUnlockRWLock(&stepInfo->parent->guard);
+  }
+  return ncclSuccess;
+}
+
+static ncclResult_t inspectorPluginRecordEventStateProxyCtrl(struct inspectorProxyCtrlInfo *ctrlInfo,
+                                                             ncclProfilerEventState_t eState,
+                                                             ncclProfilerEventStateArgs_t* eStateArgs) {
+  inspectorLockWr(&ctrlInfo->guard);
+  inspectorRecordProxyEventState(ctrlInfo->states, &ctrlInfo->nStates, eState, eStateArgs);
+  inspectorUnlockRWLock(&ctrlInfo->guard);
+  return ncclSuccess;
+}
+
 /*
  * Description:
  *
@@ -757,6 +1120,18 @@ __hidden ncclResult_t inspectorPluginStopEvent(void *eHandle) {
     struct inspectorKernelChInfo *kernelChInfo
       = (struct inspectorKernelChInfo *)eHandle;
     return inspectorPluginStopEventKernelCh(kernelChInfo);
+  } else if (type == ncclProfileProxyOp) {
+    struct inspectorProxyOpInfo *proxyOpInfo =
+      (struct inspectorProxyOpInfo *)eHandle;
+    return inspectorPluginStopEventProxyOp(proxyOpInfo);
+  } else if (type == ncclProfileProxyStep) {
+    struct inspectorProxyStepInfo *proxyStepInfo =
+      (struct inspectorProxyStepInfo *)eHandle;
+    return inspectorPluginStopEventProxyStep(proxyStepInfo);
+  } else if (type == ncclProfileProxyCtrl) {
+    struct inspectorProxyCtrlInfo *proxyCtrlInfo =
+      (struct inspectorProxyCtrlInfo *)eHandle;
+    return inspectorPluginStopEventProxyCtrl(proxyCtrlInfo);
   }
   return ncclSuccess;
 }
@@ -786,18 +1161,36 @@ __hidden ncclResult_t inspectorPluginStopEvent(void *eHandle) {
 __hidden ncclResult_t inspectorPluginRecordEventState(void* eHandle,
                                                       ncclProfilerEventState_t eState,
                                                       ncclProfilerEventStateArgs_t* eStateArgs) {
-  if (eHandle == nullptr || eStateArgs == nullptr)
+  if (eHandle == nullptr)
     return ncclSuccess;
 
   uint64_t type = *(uint64_t *)eHandle;
 
   if (type == ncclProfileKernelCh && eState == ncclProfilerKernelChStop) {
+    if (eStateArgs == nullptr) {
+      return ncclSuccess;
+    }
 
     struct inspectorKernelChInfo *kernelChInfo
       = (struct inspectorKernelChInfo *)eHandle;
 
     return inspectorPluginRecordEventStateKernelCh(kernelChInfo,
                                                    eStateArgs);
+
+  } else if (type == ncclProfileProxyOp) {
+    struct inspectorProxyOpInfo *proxyOpInfo =
+      (struct inspectorProxyOpInfo *)eHandle;
+    return inspectorPluginRecordEventStateProxyOp(proxyOpInfo, eState, eStateArgs);
+
+  } else if (type == ncclProfileProxyStep) {
+    struct inspectorProxyStepInfo *proxyStepInfo =
+      (struct inspectorProxyStepInfo *)eHandle;
+    return inspectorPluginRecordEventStateProxyStep(proxyStepInfo, eState, eStateArgs);
+
+  } else if (type == ncclProfileProxyCtrl) {
+    struct inspectorProxyCtrlInfo *proxyCtrlInfo =
+      (struct inspectorProxyCtrlInfo *)eHandle;
+    return inspectorPluginRecordEventStateProxyCtrl(proxyCtrlInfo, eState, eStateArgs);
 
   }
   return ncclSuccess;

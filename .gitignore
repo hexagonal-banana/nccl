@@ -14,6 +14,7 @@ junits/
 tags
 *.swp
 .cache/
+compile_commands*.json
 
 # Example build artifacts
 *.o

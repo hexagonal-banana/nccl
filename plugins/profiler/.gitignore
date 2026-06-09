@@ -1,0 +1,5 @@
+# Profiler build artifacts
+example/libnccl-profiler-example.so
+inspector/libnccl-profiler-inspector.so
+inspector/version.cc
+inspector/compile_commands.json
