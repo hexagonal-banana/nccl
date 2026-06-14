@@ -17,10 +17,14 @@
 
 #include "json.h"
 #include "common.h"
+#include "inspector_inline_list.h"
 #include "version.h"
 
 #define MAX_CHANNELS                     64
-#define MAX_PROXY_EVENT_STEPS           8
+#define MAX_PROXY_EVENT_STATES          8
+#define MAX_PROXY_OP_INLINE_STEPS       32
+#define PROXY_EVENT_STATE_BLOCK_SIZE    8
+#define PROXY_OP_STEP_BLOCK_SIZE        32
 
 // Bump when ncclProfiler_t alias changes to a new interface version.
 #define NCCL_PROFILER_INTERFACE_VERSION 5
@@ -171,6 +175,31 @@ struct inspectorProxyEventStateInfo {
   int appendedProxyOps;
 };
 
+typedef inspectorInlineList<struct inspectorProxyEventStateInfo,
+                            MAX_PROXY_EVENT_STATES,
+                            PROXY_EVENT_STATE_BLOCK_SIZE>
+  inspectorProxyEventStateList;
+
+struct inspectorProxyStepRecordInfo {
+  int rank;
+  pid_t pid;
+  uint8_t channelId;
+  int peer;
+  int nSteps;
+  int chunkSize;
+  int isSend;
+  int step;
+  size_t transSize;
+  uint64_t tsStartUsec;
+  uint64_t tsCompletedUsec;
+  inspectorProxyEventStateList states;
+};
+
+typedef inspectorInlineList<struct inspectorProxyStepRecordInfo,
+                            MAX_PROXY_OP_INLINE_STEPS,
+                            PROXY_OP_STEP_BLOCK_SIZE>
+  inspectorProxyStepRecordList;
+
 struct inspectorCompletedProxyEventInfo {
   inspectorProxyEventType_t proxyType;
   uint64_t proxyId;
@@ -185,8 +214,8 @@ struct inspectorCompletedProxyEventInfo {
   size_t transSize;
   uint64_t tsStartUsec;
   uint64_t tsCompletedUsec;
-  uint32_t nStates;
-  struct inspectorProxyEventStateInfo states[MAX_PROXY_EVENT_STEPS];
+  inspectorProxyEventStateList states;
+  inspectorProxyStepRecordList steps;
 };
 
 #include "inspector_ring.h"
@@ -324,8 +353,8 @@ struct inspectorProxyOpInfo {
   size_t transSize;
   uint64_t tsStartUsec;
   uint64_t tsCompletedUsec;
-  uint32_t nStates;
-  struct inspectorProxyEventStateInfo states[MAX_PROXY_EVENT_STEPS];
+  inspectorProxyEventStateList states;
+  inspectorProxyStepRecordList steps;
   pthread_rwlock_t guard;
 };
 
@@ -340,8 +369,7 @@ struct inspectorProxyStepInfo {
   size_t transSize;
   uint64_t tsStartUsec;
   uint64_t tsCompletedUsec;
-  uint32_t nStates;
-  struct inspectorProxyEventStateInfo states[MAX_PROXY_EVENT_STEPS];
+  inspectorProxyEventStateList states;
   pthread_rwlock_t guard;
 };
 
@@ -351,8 +379,7 @@ struct inspectorProxyCtrlInfo {
   uint64_t proxyId;
   uint64_t tsStartUsec;
   uint64_t tsCompletedUsec;
-  uint32_t nStates;
-  struct inspectorProxyEventStateInfo states[MAX_PROXY_EVENT_STEPS];
+  inspectorProxyEventStateList states;
   pthread_rwlock_t guard;
 };
 
@@ -415,6 +442,10 @@ extern bool requireKernelTiming;
 extern size_t ncclInspectorDumpMinSizeBytes;
 
 bool inspectorIsDumpVerboseEnabled();
+
+inspectorResult_t inspectorCompletedProxyEventInfoCopy(void* dst,
+                                                       const void* src);
+void inspectorCompletedProxyEventInfoCleanup(void* entry);
 
 const char* inspectorErrorString(inspectorResult_t result);
 

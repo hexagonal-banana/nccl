@@ -24,8 +24,18 @@
 inspectorResult_t inspectorRingInit(struct inspectorCompletedRing* ring,
                                     uint32_t size,
                                     size_t entrySize) {
+  return inspectorRingInitWithCallbacks(ring, size, entrySize, nullptr, nullptr);
+}
+
+inspectorResult_t inspectorRingInitWithCallbacks(struct inspectorCompletedRing* ring,
+                                                 uint32_t size,
+                                                 size_t entrySize,
+                                                 inspectorRingEntryCopyFn copyEntry,
+                                                 inspectorRingEntryDestroyFn destroyEntry) {
   if (!ring) return inspectorMemoryError;
   ring->entrySize = entrySize;
+  ring->copyEntry = copyEntry;
+  ring->destroyEntry = destroyEntry;
   if (size == 0) {
     ring->entries = nullptr;
     ring->size = ring->head = ring->tail = 0;
@@ -61,9 +71,19 @@ inspectorResult_t inspectorRingInit(struct inspectorCompletedRing* ring,
  */
 void inspectorRingFinalize(struct inspectorCompletedRing* ring) {
   if (!ring) return;
+  if (ring->destroyEntry && ring->entries && ring->size > 0) {
+    uint32_t bufSize = ring->size + 1;
+    uint32_t count = (ring->tail + bufSize - ring->head) % bufSize;
+    for (uint32_t i = 0; i < count; i++) {
+      uint32_t idx = (ring->head + i) % bufSize;
+      ring->destroyEntry(ringSlot(ring, idx));
+    }
+  }
   free(ring->entries);
   ring->entries = nullptr;
   ring->size = ring->head = ring->tail = 0;
+  ring->copyEntry = nullptr;
+  ring->destroyEntry = nullptr;
 }
 
 /*
@@ -92,10 +112,17 @@ inspectorResult_t inspectorRingEnqueue(struct inspectorCompletedRing* ring,
   uint32_t bufSize = ring->size + 1;
   if ((ring->tail + 1) % bufSize == ring->head) {
     // Ring is full: advance head to overwrite the oldest entry
+    if (ring->destroyEntry) ring->destroyEntry(ringSlot(ring, ring->head));
     ring->head = (ring->head + 1) % bufSize;
   }
 
-  memcpy(ringSlot(ring, ring->tail), entry, ring->entrySize);
+  void* dst = ringSlot(ring, ring->tail);
+  if (ring->copyEntry) {
+    inspectorResult_t res = ring->copyEntry(dst, entry);
+    if (res != inspectorSuccess) return res;
+  } else {
+    memcpy(dst, entry, ring->entrySize);
+  }
   ring->tail = (ring->tail + 1) % bufSize;
   return inspectorSuccess;
 }

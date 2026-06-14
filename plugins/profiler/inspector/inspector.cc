@@ -1246,8 +1246,11 @@ static inspectorResult_t inspectorFillCommInfo(struct inspectorCommInfo* commInf
                             sizeof(struct inspectorCompletedOpInfo)));
   INS_CHK(inspectorRingInit(&commInfo->completedP2pRing, ncclInspectorDumpP2pRingSize,
                             sizeof(struct inspectorCompletedOpInfo)));
-  INS_CHK(inspectorRingInit(&commInfo->completedProxyRing, ncclInspectorDumpProxyRingSize,
-                            sizeof(struct inspectorCompletedProxyEventInfo)));
+  INS_CHK(inspectorRingInitWithCallbacks(&commInfo->completedProxyRing,
+                                         ncclInspectorDumpProxyRingSize,
+                                         sizeof(struct inspectorCompletedProxyEventInfo),
+                                         inspectorCompletedProxyEventInfoCopy,
+                                         inspectorCompletedProxyEventInfoCleanup));
 
   // Capture current CUDA device ID and convert to UUID string
   int cudaDeviceId = -1;

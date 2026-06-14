@@ -300,6 +300,65 @@ static const char* inspectorProxyDirectionToString(int isSend) {
   return "Unknown";
 }
 
+static inline inspectorResult_t inspectorProxyStateList(jsonFileOutput* jfo,
+                                                        const inspectorProxyEventStateList* states) {
+  JSON_CHK(jsonStartList(jfo));
+  uint32_t count = states ? states->count : 0;
+  for (uint32_t i = 0; i < count; i++) {
+    const struct inspectorProxyEventStateInfo* state =
+      inspectorInlineListGet(states, i);
+    if (state == nullptr) return inspectorMemoryError;
+
+    JSON_CHK(jsonStartObject(jfo));
+    JSON_CHK(jsonKey(jfo, "state")); JSON_CHK(jsonStr(jfo, inspectorProxyEventStateToString(state->state)));
+    JSON_CHK(jsonKey(jfo, "state_id")); JSON_CHK(jsonInt(jfo, state->state));
+    JSON_CHK(jsonKey(jfo, "state_ts")); JSON_CHK(jsonUint64(jfo, state->tsUsec));
+    if (state->transSize != 0) {
+      JSON_CHK(jsonKey(jfo, "trans_size")); JSON_CHK(jsonUint64(jfo, state->transSize));
+    }
+    if (state->appendedProxyOps != 0) {
+      JSON_CHK(jsonKey(jfo, "appended_proxy_ops")); JSON_CHK(jsonInt(jfo, state->appendedProxyOps));
+    }
+    JSON_CHK(jsonFinishObject(jfo));
+  }
+  JSON_CHK(jsonFinishList(jfo));
+  return inspectorSuccess;
+}
+
+static inline inspectorResult_t inspectorProxyStepRecord(jsonFileOutput* jfo,
+                                                         const struct inspectorProxyStepRecordInfo* step) {
+  if (step == nullptr) return inspectorMemoryError;
+
+  JSON_CHK(jsonStartObject(jfo));
+  {
+    JSON_CHK(jsonKey(jfo, "proxy_step")); JSON_CHK(jsonInt(jfo, step->step));
+    JSON_CHK(jsonKey(jfo, "proxy_start_ts")); JSON_CHK(jsonUint64(jfo, step->tsStartUsec));
+    JSON_CHK(jsonKey(jfo, "proxy_stop_ts")); JSON_CHK(jsonUint64(jfo, step->tsCompletedUsec));
+    uint64_t durationUsec =
+      (step->tsCompletedUsec >= step->tsStartUsec) ?
+      (step->tsCompletedUsec - step->tsStartUsec) : 0;
+    JSON_CHK(jsonKey(jfo, "proxy_duration_us")); JSON_CHK(jsonUint64(jfo, durationUsec));
+    JSON_CHK(jsonKey(jfo, "proxy_trans_size")); JSON_CHK(jsonUint64(jfo, step->transSize));
+    JSON_CHK(jsonKey(jfo, "proxy_states"));
+    INS_CHK(inspectorProxyStateList(jfo, &step->states));
+  }
+  JSON_CHK(jsonFinishObject(jfo));
+  return inspectorSuccess;
+}
+
+static inline inspectorResult_t inspectorProxyStepList(jsonFileOutput* jfo,
+                                                       const inspectorProxyStepRecordList* steps) {
+  JSON_CHK(jsonStartList(jfo));
+  uint32_t count = steps ? steps->count : 0;
+  for (uint32_t i = 0; i < count; i++) {
+    const struct inspectorProxyStepRecordInfo* step =
+      inspectorInlineListGet(steps, i);
+    INS_CHK(inspectorProxyStepRecord(jfo, step));
+  }
+  JSON_CHK(jsonFinishList(jfo));
+  return inspectorSuccess;
+}
+
 static inline inspectorResult_t inspectorCompletedProxy(jsonFileOutput* jfo,
                                                         const struct inspectorCompletedProxyEventInfo* proxy) {
   JSON_CHK(jsonStartObject(jfo));
@@ -336,21 +395,14 @@ static inline inspectorResult_t inspectorCompletedProxy(jsonFileOutput* jfo,
     }
 
     JSON_CHK(jsonKey(jfo, "proxy_states"));
-    JSON_CHK(jsonStartList(jfo));
-    for (uint32_t i = 0; i < proxy->nStates; i++) {
-      JSON_CHK(jsonStartObject(jfo));
-      JSON_CHK(jsonKey(jfo, "state")); JSON_CHK(jsonStr(jfo, inspectorProxyEventStateToString(proxy->states[i].state)));
-      JSON_CHK(jsonKey(jfo, "state_id")); JSON_CHK(jsonInt(jfo, proxy->states[i].state));
-      JSON_CHK(jsonKey(jfo, "state_ts")); JSON_CHK(jsonUint64(jfo, proxy->states[i].tsUsec));
-      if (proxy->states[i].transSize != 0) {
-        JSON_CHK(jsonKey(jfo, "trans_size")); JSON_CHK(jsonUint64(jfo, proxy->states[i].transSize));
-      }
-      if (proxy->states[i].appendedProxyOps != 0) {
-        JSON_CHK(jsonKey(jfo, "appended_proxy_ops")); JSON_CHK(jsonInt(jfo, proxy->states[i].appendedProxyOps));
-      }
-      JSON_CHK(jsonFinishObject(jfo));
+    INS_CHK(inspectorProxyStateList(jfo, &proxy->states));
+
+    if (proxy->proxyType == inspectorProxyEventTypeOp) {
+      JSON_CHK(jsonKey(jfo, "proxy_step_count"));
+      JSON_CHK(jsonUint64(jfo, proxy->steps.count));
+      JSON_CHK(jsonKey(jfo, "proxy_steps"));
+      INS_CHK(inspectorProxyStepList(jfo, &proxy->steps));
     }
-    JSON_CHK(jsonFinishList(jfo));
   }
   JSON_CHK(jsonFinishObject(jfo));
 
@@ -476,8 +528,9 @@ static inspectorResult_t inspectorCommInfoDumpProxy(jsonFileOutput* jfo,
     return inspectorSuccess;
   }
 
-  thread_local std::vector<inspectorCompletedProxyEventInfo> drainedProxy;
-  drainedProxy.clear();
+  std::vector<inspectorCompletedProxyEventInfo> drainedProxy;
+  inspectorResult_t res = inspectorSuccess;
+  bool outputLocked = false;
 
   inspectorLockWr(&commInfo->guard);
   if (commInfo->dump_proxy) {
@@ -485,33 +538,44 @@ static inspectorResult_t inspectorCommInfoDumpProxy(jsonFileOutput* jfo,
         && drainedProxy.capacity() < commInfo->completedProxyRing.size) {
       drainedProxy.reserve(commInfo->completedProxyRing.size);
     }
-    INS_CHK(inspectorRingDrain<inspectorCompletedProxyEventInfo>(&commInfo->completedProxyRing,
-                                                                 drainedProxy));
+    res = inspectorRingDrain<inspectorCompletedProxyEventInfo>(&commInfo->completedProxyRing,
+                                                               drainedProxy);
     commInfo->dump_proxy = inspectorRingNonEmpty(&commInfo->completedProxyRing);
   }
   inspectorUnlockRWLock(&commInfo->guard);
+  if (res != inspectorSuccess) goto cleanup;
 
   if (!drainedProxy.empty()) {
     *needs_writing = true;
-    JSON_CHK(jsonLockOutput(jfo));
+    JSON_CHK_GOTO(jsonLockOutput(jfo), res, cleanup);
+    outputLocked = true;
     for (size_t i = 0; i < drainedProxy.size(); i++) {
-      JSON_CHK(jsonStartObject(jfo));
+      JSON_CHK_GOTO(jsonStartObject(jfo), res, cleanup);
       {
-        JSON_CHK(jsonKey(jfo, "header"));
-        inspectorCommInfoHeader(jfo, commInfo);
+        JSON_CHK_GOTO(jsonKey(jfo, "header"), res, cleanup);
+        INS_CHK_GOTO(inspectorCommInfoHeader(jfo, commInfo), res, cleanup);
 
-        JSON_CHK(jsonKey(jfo, "metadata"));
-        inspectorCommInfoMetaHeader(jfo);
+        JSON_CHK_GOTO(jsonKey(jfo, "metadata"), res, cleanup);
+        INS_CHK_GOTO(inspectorCommInfoMetaHeader(jfo), res, cleanup);
 
-        JSON_CHK(jsonKey(jfo, "proxy_event"));
-        INS_CHK(inspectorCompletedProxy(jfo, &drainedProxy[i]));
+        JSON_CHK_GOTO(jsonKey(jfo, "proxy_event"), res, cleanup);
+        INS_CHK_GOTO(inspectorCompletedProxy(jfo, &drainedProxy[i]), res, cleanup);
       }
-      JSON_CHK(jsonFinishObject(jfo));
-      JSON_CHK(jsonNewline(jfo));
+      JSON_CHK_GOTO(jsonFinishObject(jfo), res, cleanup);
+      JSON_CHK_GOTO(jsonNewline(jfo), res, cleanup);
     }
-    JSON_CHK(jsonUnlockOutput(jfo));
+    JSON_CHK_GOTO(jsonUnlockOutput(jfo), res, cleanup);
+    outputLocked = false;
   }
-  return inspectorSuccess;
+
+cleanup:
+  if (outputLocked) {
+    jsonUnlockOutput(jfo);
+  }
+  for (size_t i = 0; i < drainedProxy.size(); i++) {
+    inspectorCompletedProxyEventInfoCleanup(&drainedProxy[i]);
+  }
+  return res;
 }
 
 static inspectorResult_t inspectorCommInfoDump(jsonFileOutput* jfo,

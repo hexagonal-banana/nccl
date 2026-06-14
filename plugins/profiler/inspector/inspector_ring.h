@@ -4,12 +4,17 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <vector>
 
 // Forward declaration — inspectorResult_t has a fixed underlying type so it
 // can be declared here without pulling in inspector.h (which would be circular,
 // since inspector.h includes this header for inspectorCompletedRing).
 enum inspectorResult_t : int;
+
+typedef inspectorResult_t (*inspectorRingEntryCopyFn)(void* dst,
+                                                      const void* src);
+typedef void (*inspectorRingEntryDestroyFn)(void* entry);
 
 // Generic fixed-size ring buffer (used for both coll and P2P completed entries).
 // Defined here rather than in inspector.h to keep ring logic self-contained;
@@ -26,6 +31,8 @@ struct inspectorCompletedRing {
   uint32_t size{0};     // user-visible capacity (size+1 slots are allocated)
   uint32_t head{0};     // index of oldest element
   uint32_t tail{0};     // index where next element will be written
+  inspectorRingEntryCopyFn copyEntry{nullptr};
+  inspectorRingEntryDestroyFn destroyEntry{nullptr};
 };
 
 /*
@@ -56,6 +63,11 @@ static inline bool inspectorRingNonEmpty(const struct inspectorCompletedRing* ri
 inspectorResult_t inspectorRingInit(struct inspectorCompletedRing* ring,
                                     uint32_t size,
                                     size_t entrySize);
+inspectorResult_t inspectorRingInitWithCallbacks(struct inspectorCompletedRing* ring,
+                                                 uint32_t size,
+                                                 size_t entrySize,
+                                                 inspectorRingEntryCopyFn copyEntry,
+                                                 inspectorRingEntryDestroyFn destroyEntry);
 void inspectorRingFinalize(struct inspectorCompletedRing* ring);
 inspectorResult_t inspectorRingEnqueue(struct inspectorCompletedRing* ring,
                                        const void* entry);
@@ -94,7 +106,22 @@ inspectorResult_t inspectorRingDrain(struct inspectorCompletedRing* ring,
     uint32_t count   = (ring->tail + bufSize - ring->head) % bufSize;
     for (uint32_t i = 0; i < count; i++) {
       uint32_t idx = (ring->head + i) % bufSize;
-      scratch.push_back(*static_cast<T*>(ringSlot(ring, idx)));
+      void* src = ringSlot(ring, idx);
+      if (ring->copyEntry) {
+        T item;
+        memset(&item, 0, sizeof(item));
+        inspectorResult_t res = ring->copyEntry(&item, src);
+        if (res != static_cast<inspectorResult_t>(0)) return res;
+        scratch.push_back(item);
+      } else {
+        scratch.push_back(*static_cast<T*>(src));
+      }
+    }
+    if (ring->destroyEntry) {
+      for (uint32_t i = 0; i < count; i++) {
+        uint32_t idx = (ring->head + i) % bufSize;
+        ring->destroyEntry(ringSlot(ring, idx));
+      }
     }
     ring->head = 0;
     ring->tail = 0;
