@@ -22,8 +22,10 @@
 
 #define MAX_CHANNELS                     64
 #define MAX_PROXY_EVENT_STATES          8
+#define MAX_PROXY_OP_INLINE_CHILDREN    64
 #define MAX_PROXY_OP_INLINE_STEPS       32
 #define PROXY_EVENT_STATE_BLOCK_SIZE    8
+#define PROXY_OP_CHILD_BLOCK_SIZE       64
 #define PROXY_OP_STEP_BLOCK_SIZE        32
 
 // Bump when ncclProfiler_t alias changes to a new interface version.
@@ -144,24 +146,6 @@ struct inspectorEventTrkOpInfo {
   struct inspectorEventTrkKernelInfo kernelCh[MAX_CHANNELS];
 };
 
-// Unified record stored in the completed ring buffer for both collective and
-// P2P operations.  The isP2p discriminator selects which op-type-specific
-// fields (algo/proto vs peer) are valid.
-struct inspectorCompletedOpInfo {
-  bool isP2p;
-  ncclFunc_t func;
-  uint64_t sn;
-  size_t msgSizeBytes;
-  uint64_t execTimeUsecs;
-  inspectorTimingSource_t timingSource;
-  double algoBwGbs;
-  double busBwGbs;
-  const char* algo;   // coll only (nullptr for P2P)
-  const char* proto;  // coll only (nullptr for P2P)
-  int peer;           // P2P only (unused for coll)
-  struct inspectorEventTrkOpInfo evtTrk;
-};
-
 typedef enum {
   inspectorProxyEventTypeOp = 0,
   inspectorProxyEventTypeStep = 1,
@@ -216,6 +200,30 @@ struct inspectorCompletedProxyEventInfo {
   uint64_t tsCompletedUsec;
   inspectorProxyEventStateList states;
   inspectorProxyStepRecordList steps;
+};
+
+typedef inspectorInlineList<struct inspectorCompletedProxyEventInfo,
+                            MAX_PROXY_OP_INLINE_CHILDREN,
+                            PROXY_OP_CHILD_BLOCK_SIZE>
+  inspectorProxyOpRecordList;
+
+// Unified record stored in the completed ring buffer for both collective and
+// P2P operations.  The isP2p discriminator selects which op-type-specific
+// fields (algo/proto vs peer) are valid.
+struct inspectorCompletedOpInfo {
+  bool isP2p;
+  ncclFunc_t func;
+  uint64_t sn;
+  size_t msgSizeBytes;
+  uint64_t execTimeUsecs;
+  inspectorTimingSource_t timingSource;
+  double algoBwGbs;
+  double busBwGbs;
+  const char* algo;   // coll only (nullptr for P2P)
+  const char* proto;  // coll only (nullptr for P2P)
+  int peer;           // P2P only (unused for coll)
+  struct inspectorEventTrkOpInfo evtTrk;
+  inspectorProxyOpRecordList proxyOps;
 };
 
 #include "inspector_ring.h"
@@ -302,6 +310,8 @@ struct inspectorKernelChInfo {
 struct inspectorCollInfo {
   uint64_t type;
   int refCount;
+  bool stopped;
+  bool completedEnqueued;
   struct inspectorCommInfo *commInfo;
   const char* func;
   const char* algo;
@@ -313,14 +323,19 @@ struct inspectorCollInfo {
   uint32_t nChannels;
   uint32_t nKernelChStarted;
   uint32_t nKernelChCompleted;
+  uint32_t nProxyOpsStarted;
+  uint32_t nProxyOpsCompleted;
   pthread_rwlock_t guard;
   struct inspectorKernelChInfo kernelCh[MAX_CHANNELS];
   struct inspectorEventTrkOpInfo collEvtTrk;
+  inspectorProxyOpRecordList proxyOps;
 };
 
 struct inspectorP2pInfo {
   uint64_t type;
   int refCount;
+  bool stopped;
+  bool completedEnqueued;
   struct inspectorCommInfo *commInfo;
   const char* func;
   uint64_t sn;
@@ -330,9 +345,12 @@ struct inspectorP2pInfo {
   uint32_t nChannels;
   uint32_t nKernelChStarted;
   uint32_t nKernelChCompleted;
+  uint32_t nProxyOpsStarted;
+  uint32_t nProxyOpsCompleted;
   pthread_rwlock_t guard;
   struct inspectorKernelChInfo kernelCh[MAX_CHANNELS];
   struct inspectorEventTrkOpInfo p2pEvtTrk;
+  inspectorProxyOpRecordList proxyOps;
   int peer;
 };
 
@@ -342,6 +360,8 @@ struct inspectorProxyOpInfo {
   bool stopped;
   bool enqueued;
   struct inspectorCommInfo *commInfo;
+  uint64_t parentType;
+  void* parentObj;
   uint64_t proxyId;
   int rank;
   pid_t pid;
@@ -397,15 +417,16 @@ struct inspectorState {
 
 
 extern ncclDebugLogger_t logFn;
-#define VERSION(...) logFn(NCCL_LOG_VERSION, NCCL_ALL, __FILE__, __LINE__, __VA_ARGS__)
-#define INFO(FLAGS, ...) logFn(NCCL_LOG_INFO, (FLAGS), __func__, __LINE__, __VA_ARGS__)
+#define INSPECTOR_LOGFN_VALID() (logFn != nullptr && (uintptr_t)logFn > 4096)
+#define VERSION(...) do { if (INSPECTOR_LOGFN_VALID()) logFn(NCCL_LOG_VERSION, NCCL_ALL, __FILE__, __LINE__, __VA_ARGS__); } while (0)
+#define INFO(FLAGS, ...) do { if (INSPECTOR_LOGFN_VALID()) logFn(NCCL_LOG_INFO, (FLAGS), __func__, __LINE__, __VA_ARGS__); } while (0)
 
 // Use NCCL_PROFILE for inspector messages so they can be filtered with NCCL_DEBUG_SUBSYS=PROFILE
-#define INFO_INSPECTOR(...) logFn(NCCL_LOG_INFO, NCCL_PROFILE, __func__, __LINE__, __VA_ARGS__)
-#define TRACE_INSPECTOR(...) logFn(NCCL_LOG_TRACE, NCCL_PROFILE, __func__, __LINE__, __VA_ARGS__)
+#define INFO_INSPECTOR(...) do { if (INSPECTOR_LOGFN_VALID()) logFn(NCCL_LOG_INFO, NCCL_PROFILE, __func__, __LINE__, __VA_ARGS__); } while (0)
+#define TRACE_INSPECTOR(...) do { if (INSPECTOR_LOGFN_VALID()) logFn(NCCL_LOG_TRACE, NCCL_PROFILE, __func__, __LINE__, __VA_ARGS__); } while (0)
 // Set NCCL_INSPECTOR_ENABLE_WARN=1 to enable WARN-level inspector logging (default: 0 -> INFO)
 #if NCCL_INSPECTOR_ENABLE_WARN
-#define WARN_INSPECTOR(...) logFn(NCCL_LOG_WARN, NCCL_PROFILE, __func__, __LINE__, __VA_ARGS__)
+#define WARN_INSPECTOR(...) do { if (INSPECTOR_LOGFN_VALID()) logFn(NCCL_LOG_WARN, NCCL_PROFILE, __func__, __LINE__, __VA_ARGS__); } while (0)
 #else
 #define WARN_INSPECTOR(...) INFO_INSPECTOR(__VA_ARGS__)
 #endif
@@ -446,6 +467,15 @@ bool inspectorIsDumpVerboseEnabled();
 inspectorResult_t inspectorCompletedProxyEventInfoCopy(void* dst,
                                                        const void* src);
 void inspectorCompletedProxyEventInfoCleanup(void* entry);
+inspectorResult_t inspectorCompletedOpInfoCopy(void* dst, const void* src);
+void inspectorCompletedOpInfoCleanup(void* entry);
+inspectorResult_t inspectorProxyOpRecordListAppend(
+    inspectorProxyOpRecordList* list,
+    const struct inspectorCompletedProxyEventInfo* record);
+inspectorResult_t inspectorProxyOpRecordListCopy(
+    inspectorProxyOpRecordList* dst,
+    const inspectorProxyOpRecordList* src);
+void inspectorProxyOpRecordListCleanup(inspectorProxyOpRecordList* proxyOps);
 
 const char* inspectorErrorString(inspectorResult_t result);
 

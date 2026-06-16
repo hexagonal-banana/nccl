@@ -21,8 +21,19 @@
       INFO_INSPECTOR("jsonError: %s\n", jsonErrorString(macro_res));    \
       res = inspectorJsonError;                                         \
       goto label;                                                       \
-    }                                                                   \
-  } while (0)
+      }                                                                   \
+    } while (0)
+
+static void inspectorCompletedOpVectorCleanup(std::vector<inspectorCompletedOpInfo>& ops) {
+  for (size_t i = 0; i < ops.size(); i++) {
+    inspectorCompletedOpInfoCleanup(&ops[i]);
+  }
+  ops.clear();
+}
+
+static inline inspectorResult_t inspectorCompletedOpChildEventList(
+    jsonFileOutput* jfo,
+    const struct inspectorCompletedOpInfo* op);
 
 static inspectorResult_t inspectorCommInfoHeader(jsonFileOutput* jfo,
                                                  struct inspectorCommInfo* commInfo) {
@@ -59,7 +70,7 @@ static inspectorResult_t inspectorCommInfoHeader(jsonFileOutput* jfo,
 static inspectorResult_t inspectorCommInfoMetaHeader(jsonFileOutput* jfo) {
   JSON_CHK(jsonStartObject(jfo));
   {
-    JSON_CHK(jsonKey(jfo, "inspector_output_format_version")); JSON_CHK(jsonStr(jfo, "v4.0"));
+    JSON_CHK(jsonKey(jfo, "inspector_output_format_version")); JSON_CHK(jsonStr(jfo, "v4.1"));
     JSON_CHK(jsonKey(jfo, "git_rev")); JSON_CHK(jsonStr(jfo, get_git_version_info()));
     JSON_CHK(jsonKey(jfo, "rec_mechanism")); JSON_CHK(jsonStr(jfo, "nccl_profiler_interface"));
     JSON_CHK(jsonKey(jfo, "dump_timestamp_us")); JSON_CHK(jsonUint64(jfo, inspectorGetTime()));
@@ -99,18 +110,6 @@ static inline inspectorResult_t inspectorCompletedCollVerbose(jsonFileOutput* jf
   {
     JSON_CHK(jsonKey(jfo, "coll_start_sn")); JSON_CHK(jsonUint64(jfo, op->evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_START].sn));
     JSON_CHK(jsonKey(jfo, "coll_stop_sn")); JSON_CHK(jsonUint64(jfo, op->evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_STOP].sn));
-
-    JSON_CHK(jsonKey(jfo, "kernel_events"));
-    JSON_CHK(jsonStartList(jfo));
-    for (uint32_t ch = 0; ch < op->evtTrk.nChannels; ch++) {
-      JSON_CHK(jsonStartObject(jfo));
-      JSON_CHK(jsonKey(jfo, "channel_id")); JSON_CHK(jsonInt(jfo, ch));
-      JSON_CHK(jsonKey(jfo, "kernel_start_sn")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_START].sn));
-      JSON_CHK(jsonKey(jfo, "kernel_stop_sn")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_STOP].sn));
-      JSON_CHK(jsonKey(jfo, "kernel_record_sn")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_RECORD].sn));
-      JSON_CHK(jsonFinishObject(jfo));
-    }
-    JSON_CHK(jsonFinishList(jfo));
   }
   JSON_CHK(jsonFinishObject(jfo));
 
@@ -119,20 +118,11 @@ static inline inspectorResult_t inspectorCompletedCollVerbose(jsonFileOutput* jf
   {
     JSON_CHK(jsonKey(jfo, "coll_start_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_START].ts));
     JSON_CHK(jsonKey(jfo, "coll_stop_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_STOP].ts));
-
-    JSON_CHK(jsonKey(jfo, "kernel_events"));
-    JSON_CHK(jsonStartList(jfo));
-    for (uint32_t ch = 0; ch < op->evtTrk.nChannels; ch++) {
-      JSON_CHK(jsonStartObject(jfo));
-      JSON_CHK(jsonKey(jfo, "channel_id")); JSON_CHK(jsonInt(jfo, ch));
-      JSON_CHK(jsonKey(jfo, "kernel_start_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_START].ts));
-      JSON_CHK(jsonKey(jfo, "kernel_stop_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_STOP].ts));
-      JSON_CHK(jsonKey(jfo, "kernel_record_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_RECORD].ts));
-      JSON_CHK(jsonFinishObject(jfo));
-    }
-    JSON_CHK(jsonFinishList(jfo));
   }
   JSON_CHK(jsonFinishObject(jfo));
+
+  JSON_CHK(jsonKey(jfo, "events"));
+  INS_CHK(inspectorCompletedOpChildEventList(jfo, op));
 
   return inspectorSuccess;
 }
@@ -144,18 +134,6 @@ static inline inspectorResult_t inspectorCompletedP2pVerbose(jsonFileOutput* jfo
   {
     JSON_CHK(jsonKey(jfo, "p2p_start_sn")); JSON_CHK(jsonUint64(jfo, op->evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_START].sn));
     JSON_CHK(jsonKey(jfo, "p2p_stop_sn")); JSON_CHK(jsonUint64(jfo, op->evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_STOP].sn));
-
-    JSON_CHK(jsonKey(jfo, "kernel_events"));
-    JSON_CHK(jsonStartList(jfo));
-    for (uint32_t ch = 0; ch < op->evtTrk.nChannels; ch++) {
-      JSON_CHK(jsonStartObject(jfo));
-      JSON_CHK(jsonKey(jfo, "channel_id")); JSON_CHK(jsonInt(jfo, ch));
-      JSON_CHK(jsonKey(jfo, "kernel_start_sn")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_START].sn));
-      JSON_CHK(jsonKey(jfo, "kernel_stop_sn")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_STOP].sn));
-      JSON_CHK(jsonKey(jfo, "kernel_record_sn")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_RECORD].sn));
-      JSON_CHK(jsonFinishObject(jfo));
-    }
-    JSON_CHK(jsonFinishList(jfo));
   }
   JSON_CHK(jsonFinishObject(jfo));
 
@@ -164,20 +142,11 @@ static inline inspectorResult_t inspectorCompletedP2pVerbose(jsonFileOutput* jfo
   {
     JSON_CHK(jsonKey(jfo, "p2p_start_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_START].ts));
     JSON_CHK(jsonKey(jfo, "p2p_stop_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_STOP].ts));
-
-    JSON_CHK(jsonKey(jfo, "kernel_events"));
-    JSON_CHK(jsonStartList(jfo));
-    for (uint32_t ch = 0; ch < op->evtTrk.nChannels; ch++) {
-      JSON_CHK(jsonStartObject(jfo));
-      JSON_CHK(jsonKey(jfo, "channel_id")); JSON_CHK(jsonInt(jfo, ch));
-      JSON_CHK(jsonKey(jfo, "kernel_start_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_START].ts));
-      JSON_CHK(jsonKey(jfo, "kernel_stop_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_STOP].ts));
-      JSON_CHK(jsonKey(jfo, "kernel_record_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_RECORD].ts));
-      JSON_CHK(jsonFinishObject(jfo));
-    }
-    JSON_CHK(jsonFinishList(jfo));
   }
   JSON_CHK(jsonFinishObject(jfo));
+
+  JSON_CHK(jsonKey(jfo, "events"));
+  INS_CHK(inspectorCompletedOpChildEventList(jfo, op));
 
   return inspectorSuccess;
 }
@@ -331,6 +300,7 @@ static inline inspectorResult_t inspectorProxyStepRecord(jsonFileOutput* jfo,
 
   JSON_CHK(jsonStartObject(jfo));
   {
+    JSON_CHK(jsonKey(jfo, "event_type")); JSON_CHK(jsonStr(jfo, "ProxyStep"));
     JSON_CHK(jsonKey(jfo, "proxy_step")); JSON_CHK(jsonInt(jfo, step->step));
     JSON_CHK(jsonKey(jfo, "proxy_start_ts")); JSON_CHK(jsonUint64(jfo, step->tsStartUsec));
     JSON_CHK(jsonKey(jfo, "proxy_stop_ts")); JSON_CHK(jsonUint64(jfo, step->tsCompletedUsec));
@@ -363,7 +333,7 @@ static inline inspectorResult_t inspectorCompletedProxy(jsonFileOutput* jfo,
                                                         const struct inspectorCompletedProxyEventInfo* proxy) {
   JSON_CHK(jsonStartObject(jfo));
   {
-    JSON_CHK(jsonKey(jfo, "proxy_type")); JSON_CHK(jsonStr(jfo, inspectorProxyEventTypeToString(proxy->proxyType)));
+    JSON_CHK(jsonKey(jfo, "event_type")); JSON_CHK(jsonStr(jfo, inspectorProxyEventTypeToString(proxy->proxyType)));
 
     JSON_CHK(jsonKey(jfo, "proxy_id")); JSON_CHK(jsonUint64(jfo, proxy->proxyId));
 
@@ -400,12 +370,61 @@ static inline inspectorResult_t inspectorCompletedProxy(jsonFileOutput* jfo,
     if (proxy->proxyType == inspectorProxyEventTypeOp) {
       JSON_CHK(jsonKey(jfo, "proxy_step_count"));
       JSON_CHK(jsonUint64(jfo, proxy->steps.count));
-      JSON_CHK(jsonKey(jfo, "proxy_steps"));
+      JSON_CHK(jsonKey(jfo, "events"));
       INS_CHK(inspectorProxyStepList(jfo, &proxy->steps));
     }
   }
   JSON_CHK(jsonFinishObject(jfo));
 
+  return inspectorSuccess;
+}
+
+static inline inspectorResult_t inspectorCompletedKernelCh(jsonFileOutput* jfo,
+                                                           const struct inspectorCompletedOpInfo* op,
+                                                           uint32_t ch) {
+  JSON_CHK(jsonStartObject(jfo));
+  {
+    JSON_CHK(jsonKey(jfo, "event_type")); JSON_CHK(jsonStr(jfo, "KernelCh"));
+    JSON_CHK(jsonKey(jfo, "channel_id")); JSON_CHK(jsonInt(jfo, ch));
+
+    JSON_CHK(jsonKey(jfo, "event_trace_sn"));
+    JSON_CHK(jsonStartObject(jfo));
+    {
+      JSON_CHK(jsonKey(jfo, "kernel_start_sn")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_START].sn));
+      JSON_CHK(jsonKey(jfo, "kernel_stop_sn")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_STOP].sn));
+      JSON_CHK(jsonKey(jfo, "kernel_record_sn")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_RECORD].sn));
+    }
+    JSON_CHK(jsonFinishObject(jfo));
+
+    JSON_CHK(jsonKey(jfo, "event_trace_ts"));
+    JSON_CHK(jsonStartObject(jfo));
+    {
+      JSON_CHK(jsonKey(jfo, "kernel_start_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_START].ts));
+      JSON_CHK(jsonKey(jfo, "kernel_stop_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_STOP].ts));
+      JSON_CHK(jsonKey(jfo, "kernel_record_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_RECORD].ts));
+    }
+    JSON_CHK(jsonFinishObject(jfo));
+  }
+  JSON_CHK(jsonFinishObject(jfo));
+  return inspectorSuccess;
+}
+
+static inline inspectorResult_t inspectorCompletedOpChildEventList(
+    jsonFileOutput* jfo,
+    const struct inspectorCompletedOpInfo* op) {
+  JSON_CHK(jsonStartList(jfo));
+  for (uint32_t ch = 0; ch < op->evtTrk.nChannels; ch++) {
+    INS_CHK(inspectorCompletedKernelCh(jfo, op, ch));
+  }
+
+  uint32_t count = op->proxyOps.count;
+  for (uint32_t i = 0; i < count; i++) {
+    const struct inspectorCompletedProxyEventInfo* proxy =
+      inspectorInlineListGet(&op->proxyOps, i);
+    if (proxy == nullptr) return inspectorMemoryError;
+    INS_CHK(inspectorCompletedProxy(jfo, proxy));
+  }
+  JSON_CHK(jsonFinishList(jfo));
   return inspectorSuccess;
 }
 
@@ -438,7 +457,7 @@ static inspectorResult_t inspectorCommInfoDumpColl(jsonFileOutput* jfo,
   }
 
   thread_local std::vector<inspectorCompletedOpInfo> drainedColl;
-  drainedColl.clear();
+  inspectorCompletedOpVectorCleanup(drainedColl);
 
   inspectorLockWr(&commInfo->guard);
   if (commInfo->dump_coll) {
@@ -472,6 +491,7 @@ static inspectorResult_t inspectorCommInfoDumpColl(jsonFileOutput* jfo,
       JSON_CHK(jsonNewline(jfo));
     }
     JSON_CHK(jsonUnlockOutput(jfo));
+    inspectorCompletedOpVectorCleanup(drainedColl);
   }
   return inspectorSuccess;
 }
@@ -484,7 +504,7 @@ static inspectorResult_t inspectorCommInfoDumpP2p(jsonFileOutput* jfo,
   }
 
   thread_local std::vector<inspectorCompletedOpInfo> drainedP2p;
-  drainedP2p.clear();
+  inspectorCompletedOpVectorCleanup(drainedP2p);
 
   inspectorLockWr(&commInfo->guard);
   if (commInfo->dump_p2p) {
@@ -517,6 +537,7 @@ static inspectorResult_t inspectorCommInfoDumpP2p(jsonFileOutput* jfo,
       JSON_CHK(jsonNewline(jfo));
     }
     JSON_CHK(jsonUnlockOutput(jfo));
+    inspectorCompletedOpVectorCleanup(drainedP2p);
   }
   return inspectorSuccess;
 }
@@ -525,6 +546,9 @@ static inspectorResult_t inspectorCommInfoDumpProxy(jsonFileOutput* jfo,
                                                     inspectorCommInfo* commInfo,
                                                     bool* needs_writing) {
   if (commInfo == nullptr) {
+    return inspectorSuccess;
+  }
+  if (!inspectorIsDumpVerboseEnabled()) {
     return inspectorSuccess;
   }
 

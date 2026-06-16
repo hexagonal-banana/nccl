@@ -115,7 +115,7 @@ The tool generates:
     "nnodes": 4
   },
   "metadata": {
-    "inspector_output_format_version": "v4.0",
+    "inspector_output_format_version": "v4.1",
     "git_rev": "75e61acda-dirty",
     "rec_mechanism": "nccl_profiler_interface",
     "dump_timestamp_us": 1749490229087081,

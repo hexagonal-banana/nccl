@@ -76,6 +76,8 @@ export NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS=500
 
 - `NCCL_INSPECTOR_ENABLE_P2P=<0|1>` (default: `1`)
   Enables or disables P2P tracking.
+- `NCCL_INSPECTOR_ENABLE_PROXY=<0|1>` (default: `1`)
+  Enables or disables proxy event tracking. Proxy events are captured and written only when verbose JSON output is enabled with `NCCL_INSPECTOR_DUMP_VERBOSE=1`.
 - `NCCL_INSPECTOR_DUMP_THREAD_ENABLE=<0|1>` (default: `1`)
   Enables or disables the internal dump thread.
 - `NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS=<interval>` (default: `-1`)
@@ -83,7 +85,7 @@ export NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS=500
 - `NCCL_INSPECTOR_DUMP_DIR=<output_dir>`
   Sets the output directory for logs. If not set, defaults to `nccl-inspector-unknown-jobid` or `nccl-inspector-<slurm_job_id>` if running under SLURM.
 - `NCCL_INSPECTOR_DUMP_VERBOSE=<0|1>` (default: `0`)
-  Enables verbose output including event trace information.
+  Enables verbose output including event trace information and the nested profiler event tree for child profiler events.
 - `NCCL_INSPECTOR_PROM_DUMP=<0|1>` (default: `0`)
   Enables Prometheus format for textfile node exporter output instead of custom JSON.
 - `NCCL_INSPECTOR_DUMP_MIN_SIZE_BYTES=<bytes>` (default: `8192`)
@@ -195,7 +197,7 @@ Each output file contains JSON objects with the following structure:
     "nnodes": 1
   },
   "metadata": {
-    "inspector_output_format_version": "v4.0",
+    "inspector_output_format_version": "v4.1",
     "git_rev": "",
     "rec_mechanism": "profiler_plugin",
     "dump_timestamp_us": 1748030377748202,
@@ -221,7 +223,7 @@ To enable verbose output with event trace information, set the `NCCL_INSPECTOR_D
 export NCCL_INSPECTOR_DUMP_VERBOSE=1
 ```
 
-This will include additional event trace information in the JSON output, showing the sequence of callbacks and timestamps for each individual event.
+This will include additional event trace information in the JSON output, showing the sequence of callbacks and timestamps for each individual event. When proxy tracking is enabled, child profiler events are written as a nested tree under their parent collective or P2P operation: `coll_perf/p2p_perf -> events[]`. `ProxyOp` and `KernelCh` are sibling child events, and `ProxyStep` events are nested under their parent `ProxyOp`.
 
 ```json
 {
@@ -232,7 +234,7 @@ This will include additional event trace information in the JSON output, showing
     "nnodes": 1
   },
   "metadata": {
-    "inspector_output_format_version": "v4.0",
+    "inspector_output_format_version": "v4.1",
     "git_rev": "9019a1912-dirty",
     "rec_mechanism": "nccl_profiler_interface",
     "dump_timestamp_us": 1752867229276385,
@@ -249,28 +251,69 @@ This will include additional event trace information in the JSON output, showing
     "coll_busbw_gbs": 366.134533,
     "event_trace_sn": {
       "coll_start_sn": 1,
-      "coll_stop_sn": 2,
-      "kernel_events": [
-        {
-          "channel_id": 0,
-          "kernel_start_sn": 3,
-          "kernel_stop_sn": 48,
-          "kernel_record_sn": 47
-        }
-      ]
+      "coll_stop_sn": 2
     },
     "event_trace_ts": {
       "coll_start_ts": 1752867229235059,
-      "coll_stop_ts": 1752867229235064,
-      "kernel_events": [
-        {
-          "channel_id": 0,
+      "coll_stop_ts": 1752867229235064
+    },
+    "events": [
+      {
+        "event_type": "KernelCh",
+        "channel_id": 0,
+        "event_trace_sn": {
+          "kernel_start_sn": 3,
+          "kernel_stop_sn": 48,
+          "kernel_record_sn": 47
+        },
+        "event_trace_ts": {
           "kernel_start_ts": 1752867229235181,
           "kernel_stop_ts": 1752867229275811,
           "kernel_record_ts": 1752867229275811
         }
-      ]
-    }
+      },
+      {
+        "event_type": "ProxyOp",
+        "proxy_id": 17,
+        "proxy_rank": 4,
+        "proxy_pid": 438776,
+        "proxy_start_ts": 1752867229235201,
+        "proxy_stop_ts": 1752867229275804,
+        "proxy_duration_us": 40603,
+        "proxy_direction": "Send",
+        "proxy_channel_id": 0,
+        "proxy_peer": 5,
+        "proxy_n_steps": 8,
+        "proxy_chunk_size": 524288,
+        "proxy_trans_size": 2147483648,
+        "proxy_states": [
+          {
+            "state": "ProxyOpInProgress",
+            "state_id": 19,
+            "state_ts": 1752867229235220
+          }
+        ],
+        "proxy_step_count": 1,
+        "events": [
+          {
+            "event_type": "ProxyStep",
+            "proxy_step": 0,
+            "proxy_start_ts": 1752867229235300,
+            "proxy_stop_ts": 1752867229275600,
+            "proxy_duration_us": 40300,
+            "proxy_trans_size": 268435456,
+            "proxy_states": [
+              {
+                "state": "ProxyStepSendWait",
+                "state_id": 9,
+                "state_ts": 1752867229235400,
+                "trans_size": 268435456
+              }
+            ]
+          }
+        ]
+      }
+    ]
   }
 }
 ```
@@ -311,4 +354,3 @@ The size of output files depends on the output format and usage patterns:
 
 - The plugin is compatible with standard NCCL workflows and can be used in both single-node and multi-node (SLURM) environments.
 - For more details, see the source code and comments in `plugins/profiler/inspector/`.
-

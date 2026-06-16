@@ -1242,10 +1242,16 @@ static inspectorResult_t inspectorFillCommInfo(struct inspectorCommInfo* commInf
   commInfo->dump_proxy = false;
   commInfo->p2pSeqNum = 0;
   commInfo->proxySeqNum = 0;
-  INS_CHK(inspectorRingInit(&commInfo->completedCollRing, ncclInspectorDumpCollRingSize,
-                            sizeof(struct inspectorCompletedOpInfo)));
-  INS_CHK(inspectorRingInit(&commInfo->completedP2pRing, ncclInspectorDumpP2pRingSize,
-                            sizeof(struct inspectorCompletedOpInfo)));
+  INS_CHK(inspectorRingInitWithCallbacks(&commInfo->completedCollRing,
+                                         ncclInspectorDumpCollRingSize,
+                                         sizeof(struct inspectorCompletedOpInfo),
+                                         inspectorCompletedOpInfoCopy,
+                                         inspectorCompletedOpInfoCleanup));
+  INS_CHK(inspectorRingInitWithCallbacks(&commInfo->completedP2pRing,
+                                         ncclInspectorDumpP2pRingSize,
+                                         sizeof(struct inspectorCompletedOpInfo),
+                                         inspectorCompletedOpInfoCopy,
+                                         inspectorCompletedOpInfoCleanup));
   INS_CHK(inspectorRingInitWithCallbacks(&commInfo->completedProxyRing,
                                          ncclInspectorDumpProxyRingSize,
                                          sizeof(struct inspectorCompletedProxyEventInfo),
@@ -1428,12 +1434,6 @@ inspectorResult_t inspectorDelComm(struct inspectorCommInfo *commInfo) {
                    commInfo->commHash);
     return inspectorDeleteUnknownCommError;
   }
-
-  inspectorLockWr(&commInfoPtr->guard);
-  commInfoPtr->dump_coll = false;
-  commInfoPtr->dump_p2p = false;
-  commInfoPtr->dump_proxy = false;
-  inspectorUnlockRWLock(&commInfoPtr->guard);
 
   INSPECTOR_LOCK_WR_FLAG(&deletedCommInfoList->guard, locked,
                          "inspectorDelComm: deletedCommInfoList::guard -wr");
@@ -1627,6 +1627,7 @@ static uint64_t calculateMaxKernelExecTimeUsecs(struct inspectorCollInfo *collIn
  */
 void inspectorUpdateCollPerf(struct inspectorCompletedOpInfo *completedOp,
                              struct inspectorCollInfo *collInfo) {
+  memset(completedOp, 0, sizeof(*completedOp));
   completedOp->isP2p = false;
   completedOp->func = ncclStringToFunc(collInfo->func);
   completedOp->sn = collInfo->sn;
@@ -1636,6 +1637,7 @@ void inspectorUpdateCollPerf(struct inspectorCompletedOpInfo *completedOp,
   completedOp->algo = collInfo->algo;
   completedOp->proto = collInfo->proto;
   completedOp->evtTrk = collInfo->collEvtTrk;
+  inspectorProxyOpRecordListCopy(&completedOp->proxyOps, &collInfo->proxyOps);
 }
 
 /*
@@ -1708,6 +1710,7 @@ static uint64_t calculateMaxKernelExecTimeUsecsP2p(struct inspectorP2pInfo *p2pI
 
 void inspectorUpdateP2pPerf(struct inspectorCompletedOpInfo *completedOp,
                             struct inspectorP2pInfo *p2pInfo) {
+  memset(completedOp, 0, sizeof(*completedOp));
   completedOp->isP2p = true;
   completedOp->func = ncclStringToFunc(p2pInfo->func);
   completedOp->sn = p2pInfo->sn;
@@ -1716,6 +1719,7 @@ void inspectorUpdateP2pPerf(struct inspectorCompletedOpInfo *completedOp,
   completedOp->execTimeUsecs =
     calculateMaxKernelExecTimeUsecsP2p(p2pInfo, &completedOp->timingSource);
   completedOp->evtTrk = p2pInfo->p2pEvtTrk;
+  inspectorProxyOpRecordListCopy(&completedOp->proxyOps, &p2pInfo->proxyOps);
 }
 
 /*
@@ -1742,9 +1746,24 @@ inspectorResult_t inspectorGlobalFinalize() {
   inspectorCudaWrapCleanup();
   if (dumper) {
     dumper->stopThread();
+    dumper->inspectorStateDump(dumper->outputRoot);
     delete dumper;
     dumper = nullptr;
+  } else if (enableNcclInspector) {
+    char* dumpdir = nullptr;
+    genDumpDir(&dumpdir);
+    if (dumpdir != nullptr) {
+      if (ensureDir(dumpdir)) {
+        inspectorDumpThread finalDumper(dumpdir, -1);
+        finalDumper.inspectorStateDump(dumpdir);
+      } else {
+        INFO_INSPECTOR("NCCL Inspector: failed to generate a dump dir during finalize");
+      }
+      free(dumpdir);
+    }
   }
+  inspectorCommInfoListFinalize(&g_state.liveComms);
+  inspectorCommInfoListFinalize(&g_state.deletedComms);
   // Finalize event pools
   inspectorEventPoolFinalize();
   return inspectorSuccess;

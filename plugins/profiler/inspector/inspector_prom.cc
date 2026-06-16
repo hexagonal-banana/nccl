@@ -90,6 +90,14 @@ struct inspectorPromDevice {
 };
 static const int kInspectorPromFormatMinor = 1;
 
+static void inspectorPromCompletedOpVectorCleanup(
+    std::vector<inspectorCompletedOpInfo>& ops) {
+  for (size_t i = 0; i < ops.size(); i++) {
+    inspectorCompletedOpInfoCleanup(&ops[i]);
+  }
+  ops.clear();
+}
+
 static void inspectorPromAggUpdate(inspectorPromBucketAgg& agg,
                                    double algoBwGbs,
                                    double busBwGbs,
@@ -553,7 +561,7 @@ static inspectorResult_t inspectorPromCommInfoDumpColl(struct inspectorCommInfo*
   }
 
   thread_local std::vector<inspectorCompletedOpInfo> drainedColl;
-  drainedColl.clear();
+  inspectorPromCompletedOpVectorCleanup(drainedColl);
 
   inspectorLockWr(&commInfo->guard);
   if (commInfo->dump_coll) {
@@ -591,6 +599,7 @@ static inspectorResult_t inspectorPromCommInfoDumpColl(struct inspectorCommInfo*
                              collInfo.busBwGbs,
                              collInfo.execTimeUsecs);
     }
+    inspectorPromCompletedOpVectorCleanup(drainedColl);
   }
 
   return inspectorSuccess;
@@ -604,7 +613,7 @@ static inspectorResult_t inspectorPromCommInfoDumpP2p(struct inspectorCommInfo* 
   }
 
   thread_local std::vector<inspectorCompletedOpInfo> drainedP2p;
-  drainedP2p.clear();
+  inspectorPromCompletedOpVectorCleanup(drainedP2p);
 
   inspectorLockWr(&commInfo->guard);
   if (commInfo->dump_p2p) {
@@ -638,6 +647,7 @@ static inspectorResult_t inspectorPromCommInfoDumpP2p(struct inspectorCommInfo* 
                              p2pInfo.busBwGbs,
                              p2pInfo.execTimeUsecs);
     }
+    inspectorPromCompletedOpVectorCleanup(drainedP2p);
   }
 
   return inspectorSuccess;

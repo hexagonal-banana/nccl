@@ -133,7 +133,7 @@ __hidden ncclResult_t inspectorPluginInit(void** context, uint64_t commHash,
   if (enableNcclInspectorP2p) {
     *eActivationMask |= ncclProfileP2p;
   }
-  if (enableNcclInspectorProxy) {
+  if (enableNcclInspectorProxy && inspectorIsDumpVerboseEnabled()) {
     *eActivationMask |= ncclProfileProxyOp | ncclProfileProxyStep | ncclProfileProxyCtrl;
   }
 
@@ -186,6 +186,7 @@ inspectorResult_t inspectorPluginCollInfoDeRef(struct inspectorCollInfo *collInf
 
 static void inspectorPluginCollInfoCleanup(struct inspectorCollInfo *collInfo) {
   inspectorLockDestroy(&collInfo->guard);
+  inspectorProxyOpRecordListCleanup(&collInfo->proxyOps);
   inspectorEventPoolReleaseColl(collInfo);
 }
 
@@ -228,6 +229,7 @@ inspectorResult_t inspectorPluginP2pInfoDeRef(struct inspectorP2pInfo *p2pInfo) 
 
 static void inspectorPluginP2pInfoCleanup(struct inspectorP2pInfo *p2pInfo) {
   inspectorLockDestroy(&p2pInfo->guard);
+  inspectorProxyOpRecordListCleanup(&p2pInfo->proxyOps);
   inspectorEventPoolReleaseP2p(p2pInfo);
 }
 
@@ -365,6 +367,94 @@ inspectorResult_t inspectorCompletedProxyEventInfoCopy(void* dst, const void* sr
   return inspectorSuccess;
 }
 
+inspectorResult_t inspectorProxyOpRecordListAppend(
+    inspectorProxyOpRecordList* list,
+    const struct inspectorCompletedProxyEventInfo* record) {
+  if (list == nullptr || record == nullptr) return inspectorMemoryError;
+
+  struct inspectorCompletedProxyEventInfo tmp;
+  inspectorResult_t res = inspectorCompletedProxyEventInfoCopy(&tmp, record);
+  if (res != inspectorSuccess) return res;
+
+  struct inspectorCompletedProxyEventInfo* dst = inspectorInlineListAppend(list);
+  if (dst == nullptr) {
+    inspectorCompletedProxyEventInfoCleanup(&tmp);
+    return inspectorMemoryError;
+  }
+  *dst = tmp;
+  return inspectorSuccess;
+}
+
+void inspectorProxyOpRecordListCleanup(inspectorProxyOpRecordList* proxyOps) {
+  if (proxyOps == nullptr) return;
+  for (uint32_t i = 0; i < proxyOps->count; i++) {
+    struct inspectorCompletedProxyEventInfo* proxy =
+      inspectorInlineListGetMutable(proxyOps, i);
+    inspectorCompletedProxyEventInfoCleanup(proxy);
+  }
+  inspectorInlineListFree(proxyOps);
+}
+
+inspectorResult_t inspectorProxyOpRecordListCopy(
+    inspectorProxyOpRecordList* dst,
+    const inspectorProxyOpRecordList* src) {
+  if (dst == nullptr || src == nullptr) return inspectorMemoryError;
+
+  inspectorInlineListInit(dst);
+  for (uint32_t i = 0; i < src->count; i++) {
+    const struct inspectorCompletedProxyEventInfo* srcProxy =
+      inspectorInlineListGet(src, i);
+    if (srcProxy == nullptr) {
+      inspectorProxyOpRecordListCleanup(dst);
+      return inspectorMemoryError;
+    }
+    inspectorResult_t res = inspectorProxyOpRecordListAppend(dst, srcProxy);
+    if (res != inspectorSuccess) {
+      inspectorProxyOpRecordListCleanup(dst);
+      return res;
+    }
+  }
+  return inspectorSuccess;
+}
+
+void inspectorCompletedOpInfoCleanup(void* entry) {
+  struct inspectorCompletedOpInfo* op = (struct inspectorCompletedOpInfo*)entry;
+  if (op == nullptr) return;
+
+  inspectorProxyOpRecordListCleanup(&op->proxyOps);
+  memset(op, 0, sizeof(*op));
+}
+
+inspectorResult_t inspectorCompletedOpInfoCopy(void* dst, const void* src) {
+  if (dst == nullptr || src == nullptr) return inspectorMemoryError;
+
+  struct inspectorCompletedOpInfo* dstOp = (struct inspectorCompletedOpInfo*)dst;
+  const struct inspectorCompletedOpInfo* srcOp =
+    (const struct inspectorCompletedOpInfo*)src;
+
+  memset(dstOp, 0, sizeof(*dstOp));
+  dstOp->isP2p = srcOp->isP2p;
+  dstOp->func = srcOp->func;
+  dstOp->sn = srcOp->sn;
+  dstOp->msgSizeBytes = srcOp->msgSizeBytes;
+  dstOp->execTimeUsecs = srcOp->execTimeUsecs;
+  dstOp->timingSource = srcOp->timingSource;
+  dstOp->algoBwGbs = srcOp->algoBwGbs;
+  dstOp->busBwGbs = srcOp->busBwGbs;
+  dstOp->algo = srcOp->algo;
+  dstOp->proto = srcOp->proto;
+  dstOp->peer = srcOp->peer;
+  dstOp->evtTrk = srcOp->evtTrk;
+
+  inspectorResult_t res = inspectorProxyOpRecordListCopy(&dstOp->proxyOps,
+                                                         &srcOp->proxyOps);
+  if (res != inspectorSuccess) {
+    inspectorCompletedOpInfoCleanup(dstOp);
+    return res;
+  }
+  return inspectorSuccess;
+}
+
 static void inspectorCompletedProxyEventInfoInit(
     struct inspectorCompletedProxyEventInfo* proxy) {
   if (proxy == nullptr) return;
@@ -434,27 +524,6 @@ static inspectorResult_t inspectorCompletedProxyFromOpLocked(
                                                            &opInfo->states);
   if (res != inspectorSuccess) return res;
   return inspectorProxyStepRecordListCopy(&completedProxy->steps, &opInfo->steps);
-}
-
-static inspectorResult_t inspectorCompletedProxyFromStepLocked(
-    struct inspectorCompletedProxyEventInfo *completedProxy,
-    struct inspectorProxyStepInfo *stepInfo) {
-  inspectorCompletedProxyEventInfoInit(completedProxy);
-  completedProxy->proxyType = inspectorProxyEventTypeStep;
-  completedProxy->proxyId = stepInfo->proxyId;
-  completedProxy->rank = stepInfo->rank;
-  completedProxy->pid = stepInfo->parent ? stepInfo->parent->pid : getpid();
-  completedProxy->channelId = stepInfo->parent ? stepInfo->parent->channelId : 0;
-  completedProxy->peer = stepInfo->parent ? stepInfo->parent->peer : -1;
-  completedProxy->nSteps = stepInfo->parent ? stepInfo->parent->nSteps : 0;
-  completedProxy->chunkSize = stepInfo->parent ? stepInfo->parent->chunkSize : 0;
-  completedProxy->isSend = stepInfo->isSend;
-  completedProxy->step = stepInfo->step;
-  completedProxy->transSize = stepInfo->transSize;
-  completedProxy->tsStartUsec = stepInfo->tsStartUsec;
-  completedProxy->tsCompletedUsec = stepInfo->tsCompletedUsec;
-  return inspectorProxyEventStateListCopy(&completedProxy->states,
-                                          &stepInfo->states);
 }
 
 static inspectorResult_t inspectorCompletedProxyFromCtrlLocked(
@@ -527,6 +596,8 @@ static void inspectorPluginProxyOpInfoInit(struct inspectorProxyOpInfo **opInfo,
   opInfoPtr->type = ncclProfileProxyOp;
   opInfoPtr->refCount = 1;
   opInfoPtr->commInfo = commInfo;
+  opInfoPtr->parentType = 0;
+  opInfoPtr->parentObj = nullptr;
   opInfoPtr->proxyId = __atomic_add_fetch(&commInfo->proxySeqNum, 1, __ATOMIC_RELAXED);
   opInfoPtr->rank = eDescr->rank;
   opInfoPtr->pid = eDescr->proxyOp.pid;
@@ -539,6 +610,30 @@ static void inspectorPluginProxyOpInfoInit(struct inspectorProxyOpInfo **opInfo,
   inspectorInlineListInit(&opInfoPtr->states);
   inspectorInlineListInit(&opInfoPtr->steps);
   inspectorLockInit(&opInfoPtr->guard);
+
+  if (eDescr->parentObj != nullptr && eDescr->proxyOp.pid == getpid()) {
+    uint64_t parentType = *(uint64_t*)eDescr->parentObj;
+    if (parentType == ncclProfileColl) {
+      struct inspectorCollInfo* parent = (struct inspectorCollInfo*)eDescr->parentObj;
+      inspectorLockWr(&parent->guard);
+      parent->nProxyOpsStarted += 1;
+      inspectorPluginCollInfoRef(parent);
+      opInfoPtr->parentType = ncclProfileColl;
+      opInfoPtr->parentObj = parent;
+      opInfoPtr->commInfo = parent->commInfo;
+      inspectorUnlockRWLock(&parent->guard);
+    } else if (parentType == ncclProfileP2p) {
+      struct inspectorP2pInfo* parent = (struct inspectorP2pInfo*)eDescr->parentObj;
+      inspectorLockWr(&parent->guard);
+      parent->nProxyOpsStarted += 1;
+      inspectorPluginP2pInfoRef(parent);
+      opInfoPtr->parentType = ncclProfileP2p;
+      opInfoPtr->parentObj = parent;
+      opInfoPtr->commInfo = parent->commInfo;
+      inspectorUnlockRWLock(&parent->guard);
+    }
+  }
+
   *opInfo = opInfoPtr;
 }
 
@@ -628,6 +723,8 @@ static void inspectorPluginCollInfoInit(struct inspectorCollInfo **collInfo,
   }
   collInfoPtr->type = ncclProfileColl;
   collInfoPtr->refCount = 0;
+  collInfoPtr->stopped = false;
+  collInfoPtr->completedEnqueued = false;
   inspectorPluginCollInfoRef(collInfoPtr); //self ref; no locks needed
   collInfoPtr->func = eDescr->coll.func;
   collInfoPtr->algo = eDescr->coll.algo;
@@ -645,6 +742,7 @@ static void inspectorPluginCollInfoInit(struct inspectorCollInfo **collInfo,
   collInfoPtr->commInfo = commInfo;
   collInfoPtr->collEvtTrk.sn = 0;
   collInfoPtr->collEvtTrk.nChannels = collInfoPtr->nChannels;
+  inspectorInlineListInit(&collInfoPtr->proxyOps);
   inspectorRecordEventTrace(collInfoPtr->collEvtTrk.evntTrace,
                             NCCL_INSP_EVT_TRK_OP_START, collInfoPtr);
 
@@ -663,6 +761,8 @@ static void inspectorPluginP2pInfoInit(struct inspectorP2pInfo **p2pInfo,
   }
   p2pInfoPtr->type = ncclProfileP2p;
   p2pInfoPtr->refCount = 0;
+  p2pInfoPtr->stopped = false;
+  p2pInfoPtr->completedEnqueued = false;
   inspectorPluginP2pInfoRef(p2pInfoPtr); // self ref
   p2pInfoPtr->func = eDescr->p2p.func;
   p2pInfoPtr->nChannels = eDescr->p2p.nChannels;
@@ -678,6 +778,7 @@ static void inspectorPluginP2pInfoInit(struct inspectorP2pInfo **p2pInfo,
   p2pInfoPtr->sn = __atomic_add_fetch(&commInfo->p2pSeqNum, 1, __ATOMIC_RELAXED);
   p2pInfoPtr->p2pEvtTrk.nChannels = p2pInfoPtr->nChannels;
   p2pInfoPtr->p2pEvtTrk.sn = p2pInfoPtr->sn;
+  inspectorInlineListInit(&p2pInfoPtr->proxyOps);
   inspectorRecordP2pEventTrace(p2pInfoPtr->p2pEvtTrk.evntTrace,
                                NCCL_INSP_EVT_TRK_OP_START, p2pInfoPtr);
 
@@ -835,6 +936,76 @@ static bool inspectorShouldTrackP2p(const ncclProfilerEventDescr_t* eDescr) {
   return msgSizeBytes >= ncclInspectorDumpMinSizeBytes;
 }
 
+static bool inspectorCollKernelsCompleteLocked(const struct inspectorCollInfo* collInfo) {
+  return collInfo->nChannels == 0 ||
+         ((collInfo->nKernelChCompleted == collInfo->nKernelChStarted) &&
+          (collInfo->nKernelChCompleted == collInfo->nChannels));
+}
+
+static bool inspectorP2pKernelsCompleteLocked(const struct inspectorP2pInfo* p2pInfo) {
+  return p2pInfo->nChannels == 0 ||
+         ((p2pInfo->nKernelChCompleted == p2pInfo->nKernelChStarted) &&
+          (p2pInfo->nKernelChCompleted == p2pInfo->nChannels));
+}
+
+static inspectorResult_t inspectorPluginCollMaybeCompleteLocked(
+    struct inspectorCollInfo* collInfo,
+    struct inspectorCompletedOpInfo* completedOp,
+    bool* doCommUpdate) {
+  *doCommUpdate = false;
+  if (collInfo->completedEnqueued || !collInfo->stopped ||
+      !inspectorCollKernelsCompleteLocked(collInfo) ||
+      collInfo->nProxyOpsCompleted != collInfo->nProxyOpsStarted) {
+    return inspectorSuccess;
+  }
+
+  if (collInfo->tsCompletedUsec == 0) {
+    collInfo->tsCompletedUsec =
+      collInfo->collEvtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_STOP].ts;
+  }
+
+  inspectorUpdateCollPerf(completedOp, collInfo);
+  collInfo->completedEnqueued = true;
+
+  if (requireKernelTiming &&
+      completedOp->timingSource != inspectorTimingSourceKernelGpu) {
+    inspectorCompletedOpInfoCleanup(completedOp);
+    return inspectorSuccess;
+  }
+
+  *doCommUpdate = (collInfo->commInfo != nullptr);
+  return inspectorSuccess;
+}
+
+static inspectorResult_t inspectorPluginP2pMaybeCompleteLocked(
+    struct inspectorP2pInfo* p2pInfo,
+    struct inspectorCompletedOpInfo* completedOp,
+    bool* doCommUpdate) {
+  *doCommUpdate = false;
+  if (p2pInfo->completedEnqueued || !p2pInfo->stopped ||
+      !inspectorP2pKernelsCompleteLocked(p2pInfo) ||
+      p2pInfo->nProxyOpsCompleted != p2pInfo->nProxyOpsStarted) {
+    return inspectorSuccess;
+  }
+
+  if (p2pInfo->tsCompletedUsec == 0) {
+    p2pInfo->tsCompletedUsec =
+      p2pInfo->p2pEvtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_STOP].ts;
+  }
+
+  inspectorUpdateP2pPerf(completedOp, p2pInfo);
+  p2pInfo->completedEnqueued = true;
+
+  if (requireKernelTiming &&
+      completedOp->timingSource != inspectorTimingSourceKernelGpu) {
+    inspectorCompletedOpInfoCleanup(completedOp);
+    return inspectorSuccess;
+  }
+
+  *doCommUpdate = (p2pInfo->commInfo != nullptr);
+  return inspectorSuccess;
+}
+
 /*
  * Description:
  *
@@ -881,19 +1052,19 @@ __hidden ncclResult_t inspectorPluginStartEvent(void* context,
     inspectorPluginKernelChInfoInit(&kernelChEvent, eDescr);
     *eHandle = kernelChEvent;
   } else if (eDescr->type == ncclProfileProxyOp) {
-    if (!enableNcclInspectorProxy) return ncclSuccess;
+    if (!enableNcclInspectorProxy || !inspectorIsDumpVerboseEnabled()) return ncclSuccess;
     struct inspectorProxyOpInfo *proxyOpEvent = nullptr;
     struct inspectorCommInfo *commInfoCtx = (struct inspectorCommInfo*)context;
     inspectorPluginProxyOpInfoInit(&proxyOpEvent, eDescr, commInfoCtx);
     *eHandle = proxyOpEvent;
   } else if (eDescr->type == ncclProfileProxyStep) {
-    if (!enableNcclInspectorProxy) return ncclSuccess;
+    if (!enableNcclInspectorProxy || !inspectorIsDumpVerboseEnabled()) return ncclSuccess;
     struct inspectorProxyStepInfo *proxyStepEvent = nullptr;
     struct inspectorCommInfo *commInfoCtx = (struct inspectorCommInfo*)context;
     inspectorPluginProxyStepInfoInit(&proxyStepEvent, eDescr, commInfoCtx);
     *eHandle = proxyStepEvent;
   } else if (eDescr->type == ncclProfileProxyCtrl) {
-    if (!enableNcclInspectorProxy) return ncclSuccess;
+    if (!enableNcclInspectorProxy || !inspectorIsDumpVerboseEnabled()) return ncclSuccess;
     struct inspectorProxyCtrlInfo *proxyCtrlEvent = nullptr;
     struct inspectorCommInfo *commInfoCtx = (struct inspectorCommInfo*)context;
     inspectorPluginProxyCtrlInfoInit(&proxyCtrlEvent, commInfoCtx);
@@ -905,12 +1076,29 @@ __hidden ncclResult_t inspectorPluginStartEvent(void* context,
 }
 
 static ncclResult_t inspectorPluginStopEventColl(struct inspectorCollInfo *collInfo) {
+  struct inspectorCompletedOpInfo completedOp;
+  struct inspectorCommInfo *commInfo = nullptr;
+  bool doCommUpdate = false;
+  memset(&completedOp, 0, sizeof(completedOp));
+
   inspectorLockWr(&collInfo->guard);
   inspectorRecordEventTrace(collInfo->collEvtTrk.evntTrace,
                             NCCL_INSP_EVT_TRK_OP_STOP,
                             collInfo);
+  collInfo->stopped = true;
+  commInfo = collInfo->commInfo;
+  inspectorResult_t completeRes =
+    inspectorPluginCollMaybeCompleteLocked(collInfo, &completedOp, &doCommUpdate);
   inspectorResult_t res = inspectorPluginCollInfoDeRef(collInfo);
   inspectorUnlockRWLock(&collInfo->guard);
+  if (completeRes != inspectorSuccess) {
+    INFO_INSPECTOR("Inspector: Failed to complete collective: %s",
+                   inspectorErrorString(completeRes));
+  }
+  if (doCommUpdate) {
+    inspectorUpdateCommOpInfo(commInfo, &completedOp);
+    inspectorCompletedOpInfoCleanup(&completedOp);
+  }
   if (res == inspectorReturn) {
     inspectorPluginCollInfoCleanup(collInfo);
   }
@@ -918,12 +1106,29 @@ static ncclResult_t inspectorPluginStopEventColl(struct inspectorCollInfo *collI
 }
 
 static ncclResult_t inspectorPluginStopEventP2p(struct inspectorP2pInfo *p2pInfo) {
+  struct inspectorCompletedOpInfo completedOp;
+  struct inspectorCommInfo *commInfo = nullptr;
+  bool doCommUpdate = false;
+  memset(&completedOp, 0, sizeof(completedOp));
+
   inspectorLockWr(&p2pInfo->guard);
   inspectorRecordP2pEventTrace(p2pInfo->p2pEvtTrk.evntTrace,
                                NCCL_INSP_EVT_TRK_OP_STOP,
                                p2pInfo);
+  p2pInfo->stopped = true;
+  commInfo = p2pInfo->commInfo;
+  inspectorResult_t completeRes =
+    inspectorPluginP2pMaybeCompleteLocked(p2pInfo, &completedOp, &doCommUpdate);
   inspectorResult_t res = inspectorPluginP2pInfoDeRef(p2pInfo);
   inspectorUnlockRWLock(&p2pInfo->guard);
+  if (completeRes != inspectorSuccess) {
+    INFO_INSPECTOR("Inspector: Failed to complete P2P: %s",
+                   inspectorErrorString(completeRes));
+  }
+  if (doCommUpdate) {
+    inspectorUpdateCommOpInfo(commInfo, &completedOp);
+    inspectorCompletedOpInfoCleanup(&completedOp);
+  }
   if (res == inspectorReturn) {
     inspectorPluginP2pInfoCleanup(p2pInfo);
   }
@@ -935,6 +1140,7 @@ static ncclResult_t inspectorPluginStopEventKernelChColl(struct inspectorKernelC
   struct inspectorCompletedOpInfo completedOp;
   bool needsCleanup = false;
   bool doCommUpdate = false;
+  memset(&completedOp, 0, sizeof(completedOp));
 
   inspectorLockWr(&collInfo->guard);
   struct inspectorCommInfo *commInfo = collInfo->commInfo;
@@ -956,23 +1162,18 @@ static ncclResult_t inspectorPluginStopEventKernelChColl(struct inspectorKernelC
       && (collInfo->nKernelChCompleted == collInfo->nChannels)) {
 
     collInfo->tsCompletedUsec = kernelChInfo->tsCompletedUsec;
-    inspectorUpdateCollPerf(&completedOp, collInfo);
-
-    // Discard if GPU-based kernel timing is not available and kernel timing is required.
-    if (requireKernelTiming &&
-        completedOp.timingSource != inspectorTimingSourceKernelGpu) {
-      res = inspectorPluginCollInfoDeRef(collInfo);
-      if (res == inspectorReturn) {
-        needsCleanup = true;
-      }
-      goto done;
+    res = inspectorPluginCollMaybeCompleteLocked(collInfo, &completedOp,
+                                                &doCommUpdate);
+    if (res != inspectorSuccess) {
+      INFO_INSPECTOR("Inspector: Failed to complete collective: %s",
+                     inspectorErrorString(res));
+      doCommUpdate = false;
     }
 
     res = inspectorPluginCollInfoDeRef(collInfo);
     if (res == inspectorReturn) {
       needsCleanup = true;
     }
-    doCommUpdate = (commInfo != nullptr);
   }
 
 done:
@@ -982,6 +1183,7 @@ done:
   }
   if (doCommUpdate) {
     inspectorUpdateCommOpInfo(commInfo, &completedOp);
+    inspectorCompletedOpInfoCleanup(&completedOp);
   }
   return ncclSuccess;
 }
@@ -991,6 +1193,7 @@ static ncclResult_t inspectorPluginStopEventKernelChP2p(struct inspectorKernelCh
   struct inspectorCompletedOpInfo completedOp;
   bool needsCleanup = false;
   bool doCommUpdate = false;
+  memset(&completedOp, 0, sizeof(completedOp));
 
   inspectorLockWr(&p2pInfo->guard);
   struct inspectorCommInfo *commInfo = p2pInfo->commInfo;
@@ -1012,23 +1215,18 @@ static ncclResult_t inspectorPluginStopEventKernelChP2p(struct inspectorKernelCh
       && (p2pInfo->nKernelChCompleted == p2pInfo->nChannels)) {
 
     p2pInfo->tsCompletedUsec = kernelChInfo->tsCompletedUsec;
-    inspectorUpdateP2pPerf(&completedOp, p2pInfo);
-
-    // Discard if GPU-based kernel timing is not available and kernel timing is required.
-    if (requireKernelTiming &&
-        completedOp.timingSource != inspectorTimingSourceKernelGpu) {
-      res = inspectorPluginP2pInfoDeRef(p2pInfo);
-      if (res == inspectorReturn) {
-        needsCleanup = true;
-      }
-      goto done;
+    res = inspectorPluginP2pMaybeCompleteLocked(p2pInfo, &completedOp,
+                                               &doCommUpdate);
+    if (res != inspectorSuccess) {
+      INFO_INSPECTOR("Inspector: Failed to complete P2P: %s",
+                     inspectorErrorString(res));
+      doCommUpdate = false;
     }
 
     res = inspectorPluginP2pInfoDeRef(p2pInfo);
     if (res == inspectorReturn) {
       needsCleanup = true;
     }
-    doCommUpdate = (commInfo != nullptr);
   }
 
 done:
@@ -1038,6 +1236,7 @@ done:
   }
   if (doCommUpdate) {
     inspectorUpdateCommOpInfo(commInfo, &completedOp);
+    inspectorCompletedOpInfoCleanup(&completedOp);
   }
   return ncclSuccess;
 }
@@ -1081,12 +1280,91 @@ static inspectorResult_t inspectorProxyOpAppendStepRecordLocked(
   return inspectorProxyStepRecordListAppend(&opInfo->steps, record);
 }
 
+static inspectorResult_t inspectorPluginAppendCompletedProxyToParent(
+    struct inspectorProxyOpInfo* opInfo,
+    const struct inspectorCompletedProxyEventInfo* completedProxy,
+    struct inspectorCompletedOpInfo* completedOp,
+    struct inspectorCommInfo** commInfo,
+    bool* doCommUpdate,
+    bool* needsParentCleanup) {
+  if (opInfo == nullptr || completedProxy == nullptr || completedOp == nullptr ||
+      commInfo == nullptr || doCommUpdate == nullptr || needsParentCleanup == nullptr) {
+    return inspectorMemoryError;
+  }
+
+  *commInfo = nullptr;
+  *doCommUpdate = false;
+  *needsParentCleanup = false;
+  inspectorResult_t res = inspectorSuccess;
+
+  if (opInfo->parentType == ncclProfileColl) {
+    struct inspectorCollInfo* parent = (struct inspectorCollInfo*)opInfo->parentObj;
+    if (parent == nullptr) return inspectorSuccess;
+
+    inspectorLockWr(&parent->guard);
+    inspectorResult_t appendRes =
+      inspectorProxyOpRecordListAppend(&parent->proxyOps, completedProxy);
+    if (appendRes != inspectorSuccess) {
+      INFO_INSPECTOR("Inspector: Failed to append proxy op to collective: %s",
+                     inspectorErrorString(appendRes));
+      res = appendRes;
+    }
+    parent->nProxyOpsCompleted += 1;
+    *commInfo = parent->commInfo;
+
+    inspectorResult_t completeRes =
+      inspectorPluginCollMaybeCompleteLocked(parent, completedOp, doCommUpdate);
+    if (completeRes != inspectorSuccess) {
+      res = completeRes;
+    }
+
+    inspectorResult_t derefRes = inspectorPluginCollInfoDeRef(parent);
+    if (derefRes == inspectorReturn) {
+      *needsParentCleanup = true;
+    }
+    inspectorUnlockRWLock(&parent->guard);
+  } else if (opInfo->parentType == ncclProfileP2p) {
+    struct inspectorP2pInfo* parent = (struct inspectorP2pInfo*)opInfo->parentObj;
+    if (parent == nullptr) return inspectorSuccess;
+
+    inspectorLockWr(&parent->guard);
+    inspectorResult_t appendRes =
+      inspectorProxyOpRecordListAppend(&parent->proxyOps, completedProxy);
+    if (appendRes != inspectorSuccess) {
+      INFO_INSPECTOR("Inspector: Failed to append proxy op to P2P: %s",
+                     inspectorErrorString(appendRes));
+      res = appendRes;
+    }
+    parent->nProxyOpsCompleted += 1;
+    *commInfo = parent->commInfo;
+
+    inspectorResult_t completeRes =
+      inspectorPluginP2pMaybeCompleteLocked(parent, completedOp, doCommUpdate);
+    if (completeRes != inspectorSuccess) {
+      res = completeRes;
+    }
+
+    inspectorResult_t derefRes = inspectorPluginP2pInfoDeRef(parent);
+    if (derefRes == inspectorReturn) {
+      *needsParentCleanup = true;
+    }
+    inspectorUnlockRWLock(&parent->guard);
+  }
+
+  return res;
+}
+
 static ncclResult_t inspectorPluginStopEventProxyOp(struct inspectorProxyOpInfo *opInfo) {
   struct inspectorCompletedProxyEventInfo completedProxy;
+  struct inspectorCompletedOpInfo completedParentOp;
   struct inspectorCommInfo *commInfo = nullptr;
+  struct inspectorCommInfo *parentCommInfo = nullptr;
   bool doCommUpdate = false;
+  bool doParentCommUpdate = false;
   bool needsCleanup = false;
+  bool needsParentCleanup = false;
   inspectorCompletedProxyEventInfoInit(&completedProxy);
+  memset(&completedParentOp, 0, sizeof(completedParentOp));
 
   inspectorLockWr(&opInfo->guard);
   opInfo->tsCompletedUsec = inspectorGetTime();
@@ -1101,14 +1379,37 @@ static ncclResult_t inspectorPluginStopEventProxyOp(struct inspectorProxyOpInfo 
                    inspectorErrorString(res));
   }
 
-  if (doCommUpdate) {
+  if (needsCleanup &&
+      (opInfo->parentType == ncclProfileColl ||
+       opInfo->parentType == ncclProfileP2p)) {
+    res = inspectorPluginAppendCompletedProxyToParent(opInfo, &completedProxy,
+                                                      &completedParentOp,
+                                                      &parentCommInfo,
+                                                      &doParentCommUpdate,
+                                                      &needsParentCleanup);
+    if (res != inspectorSuccess) {
+      INFO_INSPECTOR("Inspector: Failed to attach proxy op to parent: %s",
+                     inspectorErrorString(res));
+    }
+  } else if (doCommUpdate) {
     res = inspectorUpdateCommProxyInfo(commInfo, &completedProxy);
     if (res != inspectorSuccess) {
       INFO_INSPECTOR("Inspector: Failed to enqueue proxy op: %s",
                      inspectorErrorString(res));
     }
   }
+  if (doParentCommUpdate) {
+    inspectorUpdateCommOpInfo(parentCommInfo, &completedParentOp);
+    inspectorCompletedOpInfoCleanup(&completedParentOp);
+  }
   inspectorCompletedProxyEventInfoCleanup(&completedProxy);
+  if (needsParentCleanup) {
+    if (opInfo->parentType == ncclProfileColl) {
+      inspectorPluginCollInfoCleanup((struct inspectorCollInfo*)opInfo->parentObj);
+    } else if (opInfo->parentType == ncclProfileP2p) {
+      inspectorPluginP2pInfoCleanup((struct inspectorP2pInfo*)opInfo->parentObj);
+    }
+  }
   if (needsCleanup) {
     inspectorPluginProxyOpInfoCleanup(opInfo);
   }
@@ -1116,38 +1417,26 @@ static ncclResult_t inspectorPluginStopEventProxyOp(struct inspectorProxyOpInfo 
 }
 
 static ncclResult_t inspectorPluginStopEventProxyStep(struct inspectorProxyStepInfo *stepInfo) {
-  struct inspectorCompletedProxyEventInfo completedProxy;
-  struct inspectorCompletedProxyEventInfo completedOp;
+  struct inspectorCompletedProxyEventInfo completedProxyOp;
+  struct inspectorCompletedOpInfo completedParentOp;
   struct inspectorProxyStepRecordInfo stepRecord;
-  struct inspectorCommInfo *commInfo = nullptr;
   struct inspectorCommInfo *opCommInfo = nullptr;
+  struct inspectorCommInfo *parentCommInfo = nullptr;
   bool doOpCommUpdate = false;
+  bool doParentCommUpdate = false;
   bool needsOpCleanup = false;
-  inspectorCompletedProxyEventInfoInit(&completedProxy);
-  inspectorCompletedProxyEventInfoInit(&completedOp);
+  bool needsParentCleanup = false;
+  inspectorCompletedProxyEventInfoInit(&completedProxyOp);
+  memset(&completedParentOp, 0, sizeof(completedParentOp));
   memset(&stepRecord, 0, sizeof(stepRecord));
 
   inspectorLockWr(&stepInfo->guard);
   stepInfo->tsCompletedUsec = inspectorGetTime();
-  commInfo = stepInfo->commInfo;
-  inspectorResult_t res = inspectorCompletedProxyFromStepLocked(&completedProxy, stepInfo);
   inspectorResult_t recordRes = inspectorProxyStepRecordFromStepLocked(&stepRecord, stepInfo);
   inspectorUnlockRWLock(&stepInfo->guard);
-  if (res != inspectorSuccess) {
-    INFO_INSPECTOR("Inspector: Failed to complete proxy step: %s",
-                   inspectorErrorString(res));
-  }
   if (recordRes != inspectorSuccess) {
     INFO_INSPECTOR("Inspector: Failed to copy proxy step record: %s",
                    inspectorErrorString(recordRes));
-  }
-
-  if (commInfo != nullptr && res == inspectorSuccess) {
-    res = inspectorUpdateCommProxyInfo(commInfo, &completedProxy);
-    if (res != inspectorSuccess) {
-      INFO_INSPECTOR("Inspector: Failed to enqueue proxy step: %s",
-                     inspectorErrorString(res));
-    }
   }
 
   if (stepInfo->parent != nullptr) {
@@ -1162,19 +1451,44 @@ static ncclResult_t inspectorPluginStopEventProxyStep(struct inspectorProxyStepI
       }
     }
     parent->refCount -= 1;
-    res = inspectorPluginProxyOpMaybeCompleteLocked(parent, &completedOp, &opCommInfo,
-                                                    &doOpCommUpdate, &needsOpCleanup);
+    inspectorResult_t res =
+      inspectorPluginProxyOpMaybeCompleteLocked(parent, &completedProxyOp,
+                                                &opCommInfo, &doOpCommUpdate,
+                                                &needsOpCleanup);
     inspectorUnlockRWLock(&parent->guard);
     if (res != inspectorSuccess) {
       INFO_INSPECTOR("Inspector: Failed to complete parent proxy op: %s",
                      inspectorErrorString(res));
     }
 
-    if (doOpCommUpdate) {
-      res = inspectorUpdateCommProxyInfo(opCommInfo, &completedOp);
+    if (needsOpCleanup &&
+        (parent->parentType == ncclProfileColl ||
+         parent->parentType == ncclProfileP2p)) {
+      res = inspectorPluginAppendCompletedProxyToParent(parent, &completedProxyOp,
+                                                        &completedParentOp,
+                                                        &parentCommInfo,
+                                                        &doParentCommUpdate,
+                                                        &needsParentCleanup);
+      if (res != inspectorSuccess) {
+        INFO_INSPECTOR("Inspector: Failed to attach parent proxy op: %s",
+                       inspectorErrorString(res));
+      }
+    } else if (doOpCommUpdate) {
+      res = inspectorUpdateCommProxyInfo(opCommInfo, &completedProxyOp);
       if (res != inspectorSuccess) {
         INFO_INSPECTOR("Inspector: Failed to enqueue parent proxy op: %s",
                        inspectorErrorString(res));
+      }
+    }
+    if (doParentCommUpdate) {
+      inspectorUpdateCommOpInfo(parentCommInfo, &completedParentOp);
+      inspectorCompletedOpInfoCleanup(&completedParentOp);
+    }
+    if (needsParentCleanup) {
+      if (parent->parentType == ncclProfileColl) {
+        inspectorPluginCollInfoCleanup((struct inspectorCollInfo*)parent->parentObj);
+      } else if (parent->parentType == ncclProfileP2p) {
+        inspectorPluginP2pInfoCleanup((struct inspectorP2pInfo*)parent->parentObj);
       }
     }
     if (needsOpCleanup) {
@@ -1183,8 +1497,7 @@ static ncclResult_t inspectorPluginStopEventProxyStep(struct inspectorProxyStepI
   }
 
   inspectorProxyStepRecordInfoCleanup(&stepRecord);
-  inspectorCompletedProxyEventInfoCleanup(&completedProxy);
-  inspectorCompletedProxyEventInfoCleanup(&completedOp);
+  inspectorCompletedProxyEventInfoCleanup(&completedProxyOp);
   inspectorPluginProxyStepInfoCleanup(stepInfo);
   return ncclSuccess;
 }
