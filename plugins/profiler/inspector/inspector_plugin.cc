@@ -1610,6 +1610,8 @@ static bool inspectorProxyStepStateCarriesTransSize(ncclProfilerEventState_t eSt
 static ncclResult_t inspectorPluginRecordEventStateProxyStep(struct inspectorProxyStepInfo *stepInfo,
                                                              ncclProfilerEventState_t eState,
                                                              ncclProfilerEventStateArgs_t* eStateArgs) {
+  if (eState == ncclProfilerProxyStepSendPeerWait_v4) return ncclSuccess;
+
   size_t transSize = 0;
   if (eStateArgs != nullptr && inspectorProxyStepStateCarriesTransSize(eState)) {
     transSize = eStateArgs->proxyStep.transSize;
