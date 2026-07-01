@@ -9,7 +9,10 @@
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
+#include <atomic>
+#include <new>
 #include <linux/limits.h>
+#include <sched.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/syscall.h>
@@ -25,42 +28,165 @@ static int gInitialized;
 
 static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
 
+static ncclResult_t inspectorPluginStartEventSync(void* context,
+                                                  void** eHandle,
+                                                  ncclProfilerEventDescr_t* eDescr);
 static ncclResult_t inspectorPluginStopEventSync(void *eHandle);
 static ncclResult_t inspectorPluginRecordEventStateSync(void* eHandle,
                                                         ncclProfilerEventState_t eState,
                                                         ncclProfilerEventStateArgs_t* eStateArgs);
 
 enum inspectorAsyncEventType {
-  inspectorAsyncEventStop = 0,
-  inspectorAsyncEventRecord = 1,
+  inspectorAsyncEventStart = 0,
+  inspectorAsyncEventStop = 1,
+  inspectorAsyncEventRecord = 2,
+};
+
+struct inspectorAsyncHandle {
+  uint64_t type;
+  std::atomic<void*> realHandle;
 };
 
 struct inspectorAsyncEvent {
   inspectorAsyncEventType type;
   void* eHandle;
+  void* context;
+  inspectorAsyncHandle* asyncHandle;
+  ncclProfilerEventDescr_t eDescr;
   ncclProfilerEventState_t eState;
   bool hasArgs;
   ncclProfilerEventStateArgs_t eStateArgs;
 };
 
+struct inspectorAsyncSlot {
+  inspectorAsyncEvent event;
+  std::atomic<bool> ready;
+};
+
+struct inspectorAsyncHandlePool {
+  inspectorAsyncHandle* handles;
+  inspectorAsyncHandle** freeHandles;
+  size_t size;
+  std::atomic<size_t> head;
+  std::atomic<size_t> tail;
+};
+
 struct inspectorAsyncQueue {
   bool enabled;
   bool initialized;
-  bool stop;
-  bool processing;
+  std::atomic<bool> stop;
+  std::atomic<bool> processing;
   size_t size;
-  size_t head;
-  size_t tail;
-  size_t count;
-  inspectorAsyncEvent* events;
-  pthread_mutex_t lock;
-  pthread_cond_t notEmpty;
-  pthread_cond_t notFull;
-  pthread_cond_t drained;
+  std::atomic<size_t> head;
+  std::atomic<size_t> tail;
+  inspectorAsyncSlot* slots;
   pthread_t pthread;
 };
 
 static inspectorAsyncQueue gAsyncQueue;
+static inspectorAsyncHandlePool gAsyncHandlePool;
+
+static void inspectorPluginAsyncHandlePoolReset() {
+  gAsyncHandlePool.handles = nullptr;
+  gAsyncHandlePool.freeHandles = nullptr;
+  gAsyncHandlePool.size = 0;
+  gAsyncHandlePool.head.store(0, std::memory_order_relaxed);
+  gAsyncHandlePool.tail.store(0, std::memory_order_relaxed);
+}
+
+static void inspectorPluginAsyncReset() {
+  gAsyncQueue.enabled = false;
+  gAsyncQueue.initialized = false;
+  gAsyncQueue.stop.store(false, std::memory_order_relaxed);
+  gAsyncQueue.processing.store(false, std::memory_order_relaxed);
+  gAsyncQueue.size = 0;
+  gAsyncQueue.head.store(0, std::memory_order_relaxed);
+  gAsyncQueue.tail.store(0, std::memory_order_relaxed);
+  gAsyncQueue.slots = nullptr;
+}
+
+static bool inspectorPluginIsAsyncHandle(void* eHandle) {
+  if (eHandle == nullptr || gAsyncHandlePool.handles == nullptr) return false;
+  inspectorAsyncHandle* handle = (inspectorAsyncHandle*)eHandle;
+  return handle >= gAsyncHandlePool.handles &&
+         handle < gAsyncHandlePool.handles + gAsyncHandlePool.size;
+}
+
+static void* inspectorPluginResolveAsyncHandle(void* eHandle) {
+  if (!inspectorPluginIsAsyncHandle(eHandle)) return eHandle;
+  inspectorAsyncHandle* handle = (inspectorAsyncHandle*)eHandle;
+  return handle->realHandle.load(std::memory_order_acquire);
+}
+
+static void inspectorPluginResolveDescrParent(ncclProfilerEventDescr_t* eDescr) {
+  if (eDescr == nullptr || eDescr->parentObj == nullptr) return;
+  void* realParent = inspectorPluginResolveAsyncHandle(eDescr->parentObj);
+  if (realParent != nullptr) {
+    eDescr->parentObj = realParent;
+  }
+}
+
+static inspectorResult_t inspectorPluginAsyncHandlePoolInit(size_t size) {
+  inspectorPluginAsyncHandlePoolReset();
+  gAsyncHandlePool.size = size;
+  gAsyncHandlePool.handles = new (std::nothrow) inspectorAsyncHandle[size]();
+  gAsyncHandlePool.freeHandles = new (std::nothrow) inspectorAsyncHandle*[size]();
+  if (gAsyncHandlePool.handles == nullptr || gAsyncHandlePool.freeHandles == nullptr) {
+    delete[] gAsyncHandlePool.handles;
+    delete[] gAsyncHandlePool.freeHandles;
+    inspectorPluginAsyncHandlePoolReset();
+    return inspectorMemoryError;
+  }
+
+  for (size_t i = 0; i < size; i++) {
+    gAsyncHandlePool.handles[i].realHandle.store(nullptr, std::memory_order_relaxed);
+    gAsyncHandlePool.freeHandles[i] = &gAsyncHandlePool.handles[i];
+  }
+  gAsyncHandlePool.head.store(0, std::memory_order_relaxed);
+  gAsyncHandlePool.tail.store(size, std::memory_order_relaxed);
+  return inspectorSuccess;
+}
+
+static void inspectorPluginAsyncHandlePoolFinalize() {
+  delete[] gAsyncHandlePool.handles;
+  delete[] gAsyncHandlePool.freeHandles;
+  inspectorPluginAsyncHandlePoolReset();
+}
+
+static inspectorAsyncHandle* inspectorPluginAsyncHandleAlloc(uint64_t type) {
+  if (gAsyncHandlePool.handles == nullptr) return nullptr;
+
+  size_t head;
+  while (true) {
+    head = gAsyncHandlePool.head.load(std::memory_order_acquire);
+    size_t tail = gAsyncHandlePool.tail.load(std::memory_order_acquire);
+    if (head == tail) return nullptr;
+    if (gAsyncHandlePool.head.compare_exchange_weak(head, head + 1,
+                                                    std::memory_order_acq_rel,
+                                                    std::memory_order_acquire)) {
+      break;
+    }
+  }
+
+  inspectorAsyncHandle* handle = gAsyncHandlePool.freeHandles[head % gAsyncHandlePool.size];
+  handle->type = type;
+  handle->realHandle.store(nullptr, std::memory_order_release);
+  return handle;
+}
+
+static void inspectorPluginAsyncHandleRelease(inspectorAsyncHandle* handle) {
+  if (handle == nullptr || gAsyncHandlePool.freeHandles == nullptr) return;
+
+  handle->realHandle.store(nullptr, std::memory_order_release);
+  handle->type = 0;
+  size_t tail = gAsyncHandlePool.tail.load(std::memory_order_relaxed);
+  while (tail - gAsyncHandlePool.head.load(std::memory_order_acquire) >=
+         gAsyncHandlePool.size) {
+    sched_yield();
+  }
+  gAsyncHandlePool.freeHandles[tail % gAsyncHandlePool.size] = handle;
+  gAsyncHandlePool.tail.store(tail + 1, std::memory_order_release);
+}
 
 static bool inspectorPluginAsyncEnabledFromEnv() {
   const char* str = getenv("NCCL_INSPECTOR_ASYNC_ENABLE");
@@ -77,47 +203,68 @@ static size_t inspectorPluginAsyncQueueSizeFromEnv() {
 
 static void* inspectorPluginAsyncMain(void* arg) {
   inspectorAsyncQueue* queue = (inspectorAsyncQueue*)arg;
+  uint32_t idleSpins = 0;
 
   while (true) {
-    inspectorAsyncEvent event;
-    memset(&event, 0, sizeof(event));
-
-    pthread_mutex_lock(&queue->lock);
-    while (queue->count == 0 && !queue->stop) {
-      pthread_cond_wait(&queue->notEmpty, &queue->lock);
+    size_t head = queue->head.load(std::memory_order_relaxed);
+    size_t tail = queue->tail.load(std::memory_order_acquire);
+    if (head == tail) {
+      if (queue->stop.load(std::memory_order_acquire)) {
+        break;
+      }
+      if (++idleSpins < 1024) {
+        sched_yield();
+      } else {
+        usleep(50);
+      }
+      continue;
     }
-    if (queue->count == 0 && queue->stop) {
-      pthread_mutex_unlock(&queue->lock);
-      break;
+
+    idleSpins = 0;
+    inspectorAsyncSlot* slot = &queue->slots[head % queue->size];
+    if (!slot->ready.load(std::memory_order_acquire)) {
+      sched_yield();
+      continue;
     }
+    inspectorAsyncEvent event = slot->event;
+    slot->ready.store(false, std::memory_order_release);
+    queue->processing.store(true, std::memory_order_release);
+    queue->head.store(head + 1, std::memory_order_release);
 
-    event = queue->events[queue->head];
-    queue->head = (queue->head + 1) % queue->size;
-    queue->count--;
-    queue->processing = true;
-    pthread_cond_signal(&queue->notFull);
-    pthread_mutex_unlock(&queue->lock);
-
-    if (event.type == inspectorAsyncEventStop) {
-      inspectorPluginStopEventSync(event.eHandle);
+    if (event.type == inspectorAsyncEventStart) {
+      void* realHandle = nullptr;
+      inspectorPluginResolveDescrParent(&event.eDescr);
+      inspectorPluginStartEventSync(event.context, &realHandle, &event.eDescr);
+      if (event.asyncHandle != nullptr) {
+        event.asyncHandle->realHandle.store(realHandle, std::memory_order_release);
+      }
+    } else if (event.type == inspectorAsyncEventStop) {
+      void* realHandle = inspectorPluginResolveAsyncHandle(event.eHandle);
+      if (realHandle != nullptr) {
+        inspectorPluginStopEventSync(realHandle);
+      }
+      if (inspectorPluginIsAsyncHandle(event.eHandle)) {
+        inspectorAsyncHandle* handle = (inspectorAsyncHandle*)event.eHandle;
+        if (handle->type != ncclProfileColl && handle->type != ncclProfileP2p) {
+          inspectorPluginAsyncHandleRelease(handle);
+        }
+      }
     } else if (event.type == inspectorAsyncEventRecord) {
-      inspectorPluginRecordEventStateSync(event.eHandle, event.eState,
-                                          event.hasArgs ? &event.eStateArgs : nullptr);
+      void* realHandle = inspectorPluginResolveAsyncHandle(event.eHandle);
+      if (realHandle != nullptr) {
+        inspectorPluginRecordEventStateSync(realHandle, event.eState,
+                                            event.hasArgs ? &event.eStateArgs : nullptr);
+      }
     }
 
-    pthread_mutex_lock(&queue->lock);
-    queue->processing = false;
-    if (queue->count == 0) {
-      pthread_cond_broadcast(&queue->drained);
-    }
-    pthread_mutex_unlock(&queue->lock);
+    queue->processing.store(false, std::memory_order_release);
   }
 
   return nullptr;
 }
 
 static inspectorResult_t inspectorPluginAsyncInit() {
-  memset(&gAsyncQueue, 0, sizeof(gAsyncQueue));
+  inspectorPluginAsyncReset();
   gAsyncQueue.enabled = inspectorPluginAsyncEnabledFromEnv();
   if (!gAsyncQueue.enabled) {
     INFO_INSPECTOR("NCCL Inspector: async event consumer disabled");
@@ -125,32 +272,28 @@ static inspectorResult_t inspectorPluginAsyncInit() {
   }
 
   gAsyncQueue.size = inspectorPluginAsyncQueueSizeFromEnv();
-  gAsyncQueue.events = (inspectorAsyncEvent*)calloc(gAsyncQueue.size,
-                                                   sizeof(inspectorAsyncEvent));
-  if (gAsyncQueue.events == nullptr) {
+  gAsyncQueue.slots = new (std::nothrow) inspectorAsyncSlot[gAsyncQueue.size]();
+  if (gAsyncQueue.slots == nullptr) {
     gAsyncQueue.enabled = false;
     INFO_INSPECTOR("NCCL Inspector: failed to allocate async event queue; using synchronous path");
     return inspectorSuccess;
   }
+  for (size_t i = 0; i < gAsyncQueue.size; i++) {
+    gAsyncQueue.slots[i].ready.store(false, std::memory_order_relaxed);
+  }
 
-  if (pthread_mutex_init(&gAsyncQueue.lock, nullptr) != 0 ||
-      pthread_cond_init(&gAsyncQueue.notEmpty, nullptr) != 0 ||
-      pthread_cond_init(&gAsyncQueue.notFull, nullptr) != 0 ||
-      pthread_cond_init(&gAsyncQueue.drained, nullptr) != 0) {
-    free(gAsyncQueue.events);
-    memset(&gAsyncQueue, 0, sizeof(gAsyncQueue));
-    INFO_INSPECTOR("NCCL Inspector: failed to initialize async queue locks; using synchronous path");
+  if (inspectorPluginAsyncHandlePoolInit(gAsyncQueue.size) != inspectorSuccess) {
+    delete[] gAsyncQueue.slots;
+    inspectorPluginAsyncReset();
+    INFO_INSPECTOR("NCCL Inspector: failed to allocate async handle pool; using synchronous path");
     return inspectorSuccess;
   }
 
   if (pthread_create(&gAsyncQueue.pthread, nullptr,
                      inspectorPluginAsyncMain, &gAsyncQueue) != 0) {
-    pthread_cond_destroy(&gAsyncQueue.drained);
-    pthread_cond_destroy(&gAsyncQueue.notFull);
-    pthread_cond_destroy(&gAsyncQueue.notEmpty);
-    pthread_mutex_destroy(&gAsyncQueue.lock);
-    free(gAsyncQueue.events);
-    memset(&gAsyncQueue, 0, sizeof(gAsyncQueue));
+    inspectorPluginAsyncHandlePoolFinalize();
+    delete[] gAsyncQueue.slots;
+    inspectorPluginAsyncReset();
     INFO_INSPECTOR("NCCL Inspector: failed to start async event consumer; using synchronous path");
     return inspectorSuccess;
   }
@@ -164,11 +307,11 @@ static inspectorResult_t inspectorPluginAsyncInit() {
 static void inspectorPluginAsyncFlush() {
   if (!gAsyncQueue.initialized || !gAsyncQueue.enabled) return;
 
-  pthread_mutex_lock(&gAsyncQueue.lock);
-  while (gAsyncQueue.count > 0 || gAsyncQueue.processing) {
-    pthread_cond_wait(&gAsyncQueue.drained, &gAsyncQueue.lock);
+  while (gAsyncQueue.head.load(std::memory_order_acquire) !=
+             gAsyncQueue.tail.load(std::memory_order_acquire) ||
+         gAsyncQueue.processing.load(std::memory_order_acquire)) {
+    sched_yield();
   }
-  pthread_mutex_unlock(&gAsyncQueue.lock);
 }
 
 static void inspectorPluginAsyncFinalize() {
@@ -176,19 +319,12 @@ static void inspectorPluginAsyncFinalize() {
 
   inspectorPluginAsyncFlush();
 
-  pthread_mutex_lock(&gAsyncQueue.lock);
-  gAsyncQueue.stop = true;
-  pthread_cond_broadcast(&gAsyncQueue.notEmpty);
-  pthread_cond_broadcast(&gAsyncQueue.notFull);
-  pthread_mutex_unlock(&gAsyncQueue.lock);
+  gAsyncQueue.stop.store(true, std::memory_order_release);
 
   pthread_join(gAsyncQueue.pthread, nullptr);
-  pthread_cond_destroy(&gAsyncQueue.drained);
-  pthread_cond_destroy(&gAsyncQueue.notFull);
-  pthread_cond_destroy(&gAsyncQueue.notEmpty);
-  pthread_mutex_destroy(&gAsyncQueue.lock);
-  free(gAsyncQueue.events);
-  memset(&gAsyncQueue, 0, sizeof(gAsyncQueue));
+  delete[] gAsyncQueue.slots;
+  inspectorPluginAsyncHandlePoolFinalize();
+  inspectorPluginAsyncReset();
 }
 
 static bool inspectorPluginAsyncEnqueue(const inspectorAsyncEvent* event) {
@@ -196,20 +332,34 @@ static bool inspectorPluginAsyncEnqueue(const inspectorAsyncEvent* event) {
     return false;
   }
 
-  pthread_mutex_lock(&gAsyncQueue.lock);
-  while (gAsyncQueue.count == gAsyncQueue.size && !gAsyncQueue.stop) {
-    pthread_cond_wait(&gAsyncQueue.notFull, &gAsyncQueue.lock);
+  size_t tail;
+  uint32_t fullSpins = 0;
+  while (true) {
+    if (gAsyncQueue.stop.load(std::memory_order_acquire)) {
+      return false;
+    }
+    tail = gAsyncQueue.tail.load(std::memory_order_acquire);
+    size_t head = gAsyncQueue.head.load(std::memory_order_acquire);
+    if (tail - head < gAsyncQueue.size &&
+        gAsyncQueue.tail.compare_exchange_weak(tail, tail + 1,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_acquire)) {
+      break;
+    }
+    if (++fullSpins < 1024) {
+      sched_yield();
+    } else {
+      usleep(50);
+    }
   }
-  if (gAsyncQueue.stop) {
-    pthread_mutex_unlock(&gAsyncQueue.lock);
+
+  if (gAsyncQueue.stop.load(std::memory_order_acquire)) {
     return false;
   }
 
-  gAsyncQueue.events[gAsyncQueue.tail] = *event;
-  gAsyncQueue.tail = (gAsyncQueue.tail + 1) % gAsyncQueue.size;
-  gAsyncQueue.count++;
-  pthread_cond_signal(&gAsyncQueue.notEmpty);
-  pthread_mutex_unlock(&gAsyncQueue.lock);
+  inspectorAsyncSlot* slot = &gAsyncQueue.slots[tail % gAsyncQueue.size];
+  slot->event = *event;
+  slot->ready.store(true, std::memory_order_release);
   return true;
 }
 
@@ -1247,14 +1397,15 @@ static inspectorResult_t inspectorPluginP2pMaybeCompleteLocked(
  *   ncclResult_t - success or error code.
  *
  */
-__hidden ncclResult_t inspectorPluginStartEvent(void* context,
-                                                void** eHandle,
-                                                ncclProfilerEventDescr_t* eDescr) {
+static ncclResult_t inspectorPluginStartEventSync(void* context,
+                                                  void** eHandle,
+                                                  ncclProfilerEventDescr_t* eDescr) {
   if (context == nullptr || eDescr == nullptr) {
     INFO(NCCL_INIT, "Profiler/Plugin: context/eDescr NULL for start event %s", __func__);
     return ncclSuccess;
   }
   *eHandle = nullptr;
+  inspectorPluginResolveDescrParent(eDescr);
   if (eDescr->type == ncclProfileColl) {
     if (!inspectorShouldTrackColl(eDescr)) return ncclSuccess;
     struct inspectorCollInfo *collEvent = nullptr;
@@ -1294,6 +1445,56 @@ __hidden ncclResult_t inspectorPluginStartEvent(void* context,
     return ncclSuccess;
   }
   return ncclSuccess;
+}
+
+static bool inspectorPluginShouldTrackStartEvent(ncclProfilerEventDescr_t* eDescr) {
+  if (eDescr == nullptr) return false;
+  if (eDescr->type == ncclProfileColl) {
+    return inspectorShouldTrackColl(eDescr);
+  } else if (eDescr->type == ncclProfileP2p) {
+    return enableNcclInspectorP2p && inspectorShouldTrackP2p(eDescr);
+  } else if (eDescr->type == ncclProfileKernelCh) {
+    return eDescr->parentObj != nullptr;
+  } else if (eDescr->type == ncclProfileProxyOp ||
+             eDescr->type == ncclProfileProxyStep ||
+             eDescr->type == ncclProfileProxyCtrl) {
+    return enableNcclInspectorProxy && inspectorIsDumpVerboseEnabled();
+  }
+  return false;
+}
+
+__hidden ncclResult_t inspectorPluginStartEvent(void* context,
+                                                void** eHandle,
+                                                ncclProfilerEventDescr_t* eDescr) {
+  if (eHandle == nullptr) return ncclSuccess;
+  *eHandle = nullptr;
+  if (context == nullptr || eDescr == nullptr) {
+    INFO(NCCL_INIT, "Profiler/Plugin: context/eDescr NULL for start event %s", __func__);
+    return ncclSuccess;
+  }
+
+  if (!inspectorPluginShouldTrackStartEvent(eDescr)) {
+    return ncclSuccess;
+  }
+
+  if (gAsyncQueue.initialized && gAsyncQueue.enabled) {
+    inspectorAsyncHandle* handle = inspectorPluginAsyncHandleAlloc(eDescr->type);
+    if (handle != nullptr) {
+      inspectorAsyncEvent event;
+      memset(&event, 0, sizeof(event));
+      event.type = inspectorAsyncEventStart;
+      event.context = context;
+      event.asyncHandle = handle;
+      event.eDescr = *eDescr;
+      if (inspectorPluginAsyncEnqueue(&event)) {
+        *eHandle = handle;
+        return ncclSuccess;
+      }
+      inspectorPluginAsyncHandleRelease(handle);
+    }
+  }
+
+  return inspectorPluginStartEventSync(context, eHandle, eDescr);
 }
 
 static ncclResult_t inspectorPluginStopEventColl(struct inspectorCollInfo *collInfo) {
