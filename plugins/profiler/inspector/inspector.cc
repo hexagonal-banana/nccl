@@ -844,8 +844,13 @@ static void showInspectorEnvVars() {
     {"NCCL_INSPECTOR_COLL_POOL_SIZE", getenv("NCCL_INSPECTOR_COLL_POOL_SIZE"), "256", "Collective pool initial size/stride"},
     {"NCCL_INSPECTOR_P2P_POOL_SIZE", getenv("NCCL_INSPECTOR_P2P_POOL_SIZE"), "256", "P2P pool initial size/stride"},
     {"NCCL_INSPECTOR_COMM_POOL_SIZE", getenv("NCCL_INSPECTOR_COMM_POOL_SIZE"), "256", "Comm pool initial size/stride"},
+    {"NCCL_INSPECTOR_PROXY_OP_POOL_SIZE", getenv("NCCL_INSPECTOR_PROXY_OP_POOL_SIZE"), "1024", "Proxy op pool initial size/stride"},
+    {"NCCL_INSPECTOR_PROXY_STEP_POOL_SIZE", getenv("NCCL_INSPECTOR_PROXY_STEP_POOL_SIZE"), "8192", "Proxy step pool initial size/stride"},
+    {"NCCL_INSPECTOR_PROXY_CTRL_POOL_SIZE", getenv("NCCL_INSPECTOR_PROXY_CTRL_POOL_SIZE"), "1024", "Proxy ctrl pool initial size/stride"},
     {"NCCL_INSPECTOR_POOL_GROW", getenv("NCCL_INSPECTOR_POOL_GROW"), "1", "Enable/disable dynamic growth of event pools"},
     {"NCCL_INSPECTOR_REQUIRE_KERNEL_TIMING", getenv("NCCL_INSPECTOR_REQUIRE_KERNEL_TIMING"), "1", "Require GPU-based kernel timing; discard events with CPU-measured timing"},
+    {"NCCL_INSPECTOR_ASYNC_ENABLE", getenv("NCCL_INSPECTOR_ASYNC_ENABLE"), "1", "Enable async producer/consumer event processing"},
+    {"NCCL_INSPECTOR_ASYNC_QUEUE_SIZE", getenv("NCCL_INSPECTOR_ASYNC_QUEUE_SIZE"), "262144", "Async event queue capacity"},
   };
 
   const int numEnvVars = sizeof(envVars) / sizeof(envVars[0]);
@@ -975,8 +980,19 @@ static inspectorResult_t inspectorEventPoolInitFromEnv() {
   uint32_t commPoolSize
     = getPoolSizeFromEnv("NCCL_INSPECTOR_COMM_POOL_SIZE",
                          "Comm pool size", 256, 10);
+  uint32_t proxyOpPoolSize
+    = getPoolSizeFromEnv("NCCL_INSPECTOR_PROXY_OP_POOL_SIZE",
+                         "Proxy op pool size", 1024, 16);
+  uint32_t proxyStepPoolSize
+    = getPoolSizeFromEnv("NCCL_INSPECTOR_PROXY_STEP_POOL_SIZE",
+                         "Proxy step pool size", 8192, 16);
+  uint32_t proxyCtrlPoolSize
+    = getPoolSizeFromEnv("NCCL_INSPECTOR_PROXY_CTRL_POOL_SIZE",
+                         "Proxy ctrl pool size", 1024, 16);
 
-  return inspectorEventPoolInit(collPoolSize, p2pPoolSize, commPoolSize);
+  return inspectorEventPoolInit(collPoolSize, p2pPoolSize, commPoolSize,
+                                proxyOpPoolSize, proxyStepPoolSize,
+                                proxyCtrlPoolSize);
 }
 
 /*

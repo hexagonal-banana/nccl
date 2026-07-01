@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <pthread.h>
 #include <string.h>
+#include <stdlib.h>
 #include <linux/limits.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -23,6 +24,218 @@
 static int gInitialized;
 
 static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
+
+static ncclResult_t inspectorPluginStopEventSync(void *eHandle);
+static ncclResult_t inspectorPluginRecordEventStateSync(void* eHandle,
+                                                        ncclProfilerEventState_t eState,
+                                                        ncclProfilerEventStateArgs_t* eStateArgs);
+
+enum inspectorAsyncEventType {
+  inspectorAsyncEventStop = 0,
+  inspectorAsyncEventRecord = 1,
+};
+
+struct inspectorAsyncEvent {
+  inspectorAsyncEventType type;
+  void* eHandle;
+  ncclProfilerEventState_t eState;
+  bool hasArgs;
+  ncclProfilerEventStateArgs_t eStateArgs;
+};
+
+struct inspectorAsyncQueue {
+  bool enabled;
+  bool initialized;
+  bool stop;
+  bool processing;
+  size_t size;
+  size_t head;
+  size_t tail;
+  size_t count;
+  inspectorAsyncEvent* events;
+  pthread_mutex_t lock;
+  pthread_cond_t notEmpty;
+  pthread_cond_t notFull;
+  pthread_cond_t drained;
+  pthread_t pthread;
+};
+
+static inspectorAsyncQueue gAsyncQueue;
+
+static bool inspectorPluginAsyncEnabledFromEnv() {
+  const char* str = getenv("NCCL_INSPECTOR_ASYNC_ENABLE");
+  return str == nullptr || atoi(str) != 0;
+}
+
+static size_t inspectorPluginAsyncQueueSizeFromEnv() {
+  const char* str = getenv("NCCL_INSPECTOR_ASYNC_QUEUE_SIZE");
+  uint64_t size = str ? strtoull(str, nullptr, 0) : 262144;
+  if (size < 1024) size = 1024;
+  if (size > SIZE_MAX) size = SIZE_MAX;
+  return (size_t)size;
+}
+
+static void* inspectorPluginAsyncMain(void* arg) {
+  inspectorAsyncQueue* queue = (inspectorAsyncQueue*)arg;
+
+  while (true) {
+    inspectorAsyncEvent event;
+    memset(&event, 0, sizeof(event));
+
+    pthread_mutex_lock(&queue->lock);
+    while (queue->count == 0 && !queue->stop) {
+      pthread_cond_wait(&queue->notEmpty, &queue->lock);
+    }
+    if (queue->count == 0 && queue->stop) {
+      pthread_mutex_unlock(&queue->lock);
+      break;
+    }
+
+    event = queue->events[queue->head];
+    queue->head = (queue->head + 1) % queue->size;
+    queue->count--;
+    queue->processing = true;
+    pthread_cond_signal(&queue->notFull);
+    pthread_mutex_unlock(&queue->lock);
+
+    if (event.type == inspectorAsyncEventStop) {
+      inspectorPluginStopEventSync(event.eHandle);
+    } else if (event.type == inspectorAsyncEventRecord) {
+      inspectorPluginRecordEventStateSync(event.eHandle, event.eState,
+                                          event.hasArgs ? &event.eStateArgs : nullptr);
+    }
+
+    pthread_mutex_lock(&queue->lock);
+    queue->processing = false;
+    if (queue->count == 0) {
+      pthread_cond_broadcast(&queue->drained);
+    }
+    pthread_mutex_unlock(&queue->lock);
+  }
+
+  return nullptr;
+}
+
+static inspectorResult_t inspectorPluginAsyncInit() {
+  memset(&gAsyncQueue, 0, sizeof(gAsyncQueue));
+  gAsyncQueue.enabled = inspectorPluginAsyncEnabledFromEnv();
+  if (!gAsyncQueue.enabled) {
+    INFO_INSPECTOR("NCCL Inspector: async event consumer disabled");
+    return inspectorSuccess;
+  }
+
+  gAsyncQueue.size = inspectorPluginAsyncQueueSizeFromEnv();
+  gAsyncQueue.events = (inspectorAsyncEvent*)calloc(gAsyncQueue.size,
+                                                   sizeof(inspectorAsyncEvent));
+  if (gAsyncQueue.events == nullptr) {
+    gAsyncQueue.enabled = false;
+    INFO_INSPECTOR("NCCL Inspector: failed to allocate async event queue; using synchronous path");
+    return inspectorSuccess;
+  }
+
+  if (pthread_mutex_init(&gAsyncQueue.lock, nullptr) != 0 ||
+      pthread_cond_init(&gAsyncQueue.notEmpty, nullptr) != 0 ||
+      pthread_cond_init(&gAsyncQueue.notFull, nullptr) != 0 ||
+      pthread_cond_init(&gAsyncQueue.drained, nullptr) != 0) {
+    free(gAsyncQueue.events);
+    memset(&gAsyncQueue, 0, sizeof(gAsyncQueue));
+    INFO_INSPECTOR("NCCL Inspector: failed to initialize async queue locks; using synchronous path");
+    return inspectorSuccess;
+  }
+
+  if (pthread_create(&gAsyncQueue.pthread, nullptr,
+                     inspectorPluginAsyncMain, &gAsyncQueue) != 0) {
+    pthread_cond_destroy(&gAsyncQueue.drained);
+    pthread_cond_destroy(&gAsyncQueue.notFull);
+    pthread_cond_destroy(&gAsyncQueue.notEmpty);
+    pthread_mutex_destroy(&gAsyncQueue.lock);
+    free(gAsyncQueue.events);
+    memset(&gAsyncQueue, 0, sizeof(gAsyncQueue));
+    INFO_INSPECTOR("NCCL Inspector: failed to start async event consumer; using synchronous path");
+    return inspectorSuccess;
+  }
+
+  gAsyncQueue.initialized = true;
+  INFO_INSPECTOR("NCCL Inspector: async event consumer enabled with queue size %lu",
+                 (unsigned long)gAsyncQueue.size);
+  return inspectorSuccess;
+}
+
+static void inspectorPluginAsyncFlush() {
+  if (!gAsyncQueue.initialized || !gAsyncQueue.enabled) return;
+
+  pthread_mutex_lock(&gAsyncQueue.lock);
+  while (gAsyncQueue.count > 0 || gAsyncQueue.processing) {
+    pthread_cond_wait(&gAsyncQueue.drained, &gAsyncQueue.lock);
+  }
+  pthread_mutex_unlock(&gAsyncQueue.lock);
+}
+
+static void inspectorPluginAsyncFinalize() {
+  if (!gAsyncQueue.initialized || !gAsyncQueue.enabled) return;
+
+  inspectorPluginAsyncFlush();
+
+  pthread_mutex_lock(&gAsyncQueue.lock);
+  gAsyncQueue.stop = true;
+  pthread_cond_broadcast(&gAsyncQueue.notEmpty);
+  pthread_cond_broadcast(&gAsyncQueue.notFull);
+  pthread_mutex_unlock(&gAsyncQueue.lock);
+
+  pthread_join(gAsyncQueue.pthread, nullptr);
+  pthread_cond_destroy(&gAsyncQueue.drained);
+  pthread_cond_destroy(&gAsyncQueue.notFull);
+  pthread_cond_destroy(&gAsyncQueue.notEmpty);
+  pthread_mutex_destroy(&gAsyncQueue.lock);
+  free(gAsyncQueue.events);
+  memset(&gAsyncQueue, 0, sizeof(gAsyncQueue));
+}
+
+static bool inspectorPluginAsyncEnqueue(const inspectorAsyncEvent* event) {
+  if (!gAsyncQueue.initialized || !gAsyncQueue.enabled || event == nullptr) {
+    return false;
+  }
+
+  pthread_mutex_lock(&gAsyncQueue.lock);
+  while (gAsyncQueue.count == gAsyncQueue.size && !gAsyncQueue.stop) {
+    pthread_cond_wait(&gAsyncQueue.notFull, &gAsyncQueue.lock);
+  }
+  if (gAsyncQueue.stop) {
+    pthread_mutex_unlock(&gAsyncQueue.lock);
+    return false;
+  }
+
+  gAsyncQueue.events[gAsyncQueue.tail] = *event;
+  gAsyncQueue.tail = (gAsyncQueue.tail + 1) % gAsyncQueue.size;
+  gAsyncQueue.count++;
+  pthread_cond_signal(&gAsyncQueue.notEmpty);
+  pthread_mutex_unlock(&gAsyncQueue.lock);
+  return true;
+}
+
+static bool inspectorPluginAsyncSerializesProxyEvents() {
+  return gAsyncQueue.initialized && gAsyncQueue.enabled;
+}
+
+static inspectorResult_t inspectorProxyEventLockInit(pthread_rwlock_t* lockRef) {
+  if (inspectorPluginAsyncSerializesProxyEvents()) return inspectorSuccess;
+  return inspectorLockInit(lockRef);
+}
+
+static inspectorResult_t inspectorProxyEventLockDestroy(pthread_rwlock_t* lockRef) {
+  if (inspectorPluginAsyncSerializesProxyEvents()) return inspectorSuccess;
+  return inspectorLockDestroy(lockRef);
+}
+
+static inspectorResult_t inspectorProxyEventLockWr(pthread_rwlock_t* lockRef) {
+  if (inspectorPluginAsyncSerializesProxyEvents()) return inspectorSuccess;
+  return inspectorLockWr(lockRef);
+}
+
+static inspectorResult_t inspectorProxyEventUnlock(pthread_rwlock_t* lockRef) {
+  if (inspectorPluginAsyncSerializesProxyEvents()) return inspectorSuccess;
+  return inspectorUnlockRWLock(lockRef);
+}
 
 
 /*
@@ -118,6 +331,12 @@ __hidden ncclResult_t inspectorPluginInit(void** context, uint64_t commHash,
       pthread_mutex_unlock(&gLock);
       return ncclSuccess;
     }
+    res = inspectorPluginAsyncInit();
+    if (res != inspectorSuccess) {
+      INFO_INSPECTOR("Inspector Async Init Failed %s:%d -> error %d: %s",
+                     __FILE__, __LINE__, res,
+                     inspectorErrorString(res));
+    }
   }
   pthread_mutex_unlock(&gLock);
 
@@ -162,9 +381,11 @@ __hidden ncclResult_t inspectorPluginInit(void** context, uint64_t commHash,
  *
  */
 __hidden ncclResult_t inspectorPluginFinalize(void* context) {
+  inspectorPluginAsyncFlush();
   inspectorDelComm((struct inspectorCommInfo *)context);
   pthread_mutex_lock(&gLock);
   if (--gInitialized == 0) {
+    inspectorPluginAsyncFinalize();
     inspectorGlobalFinalize();
   }
   pthread_mutex_unlock(&gLock);
@@ -551,19 +772,19 @@ static void inspectorPluginProxyOpInfoCleanup(struct inspectorProxyOpInfo *opInf
   inspectorLockDestroy(&opInfo->guard);
   inspectorInlineListFree(&opInfo->states);
   inspectorProxyStepRecordListCleanup(&opInfo->steps);
-  free(opInfo);
+  inspectorEventPoolReleaseProxyOp(opInfo);
 }
 
 static void inspectorPluginProxyStepInfoCleanup(struct inspectorProxyStepInfo *stepInfo) {
-  inspectorLockDestroy(&stepInfo->guard);
+  inspectorProxyEventLockDestroy(&stepInfo->guard);
   inspectorInlineListFree(&stepInfo->states);
-  free(stepInfo);
+  inspectorEventPoolReleaseProxyStep(stepInfo);
 }
 
 static void inspectorPluginProxyCtrlInfoCleanup(struct inspectorProxyCtrlInfo *ctrlInfo) {
-  inspectorLockDestroy(&ctrlInfo->guard);
+  inspectorProxyEventLockDestroy(&ctrlInfo->guard);
   inspectorInlineListFree(&ctrlInfo->states);
-  free(ctrlInfo);
+  inspectorEventPoolReleaseProxyCtrl(ctrlInfo);
 }
 
 static inspectorResult_t inspectorPluginProxyOpMaybeCompleteLocked(struct inspectorProxyOpInfo *opInfo,
@@ -586,7 +807,7 @@ static void inspectorPluginProxyOpInfoInit(struct inspectorProxyOpInfo **opInfo,
                                            ncclProfilerEventDescr_t *eDescr,
                                            struct inspectorCommInfo *commInfo) {
   struct inspectorProxyOpInfo *opInfoPtr =
-    (struct inspectorProxyOpInfo*)calloc(1, sizeof(struct inspectorProxyOpInfo));
+    inspectorEventPoolAllocProxyOp();
   if (opInfoPtr == nullptr) {
     INFO_INSPECTOR("Inspector: Failed to allocate memory for proxy op info structure");
     *opInfo = nullptr;
@@ -641,7 +862,7 @@ static void inspectorPluginProxyStepInfoInit(struct inspectorProxyStepInfo **ste
                                              ncclProfilerEventDescr_t *eDescr,
                                              struct inspectorCommInfo *commInfo) {
   struct inspectorProxyStepInfo *stepInfoPtr =
-    (struct inspectorProxyStepInfo*)calloc(1, sizeof(struct inspectorProxyStepInfo));
+    inspectorEventPoolAllocProxyStep();
   if (stepInfoPtr == nullptr) {
     INFO_INSPECTOR("Inspector: Failed to allocate memory for proxy step info structure");
     *stepInfo = nullptr;
@@ -668,14 +889,14 @@ static void inspectorPluginProxyStepInfoInit(struct inspectorProxyStepInfo **ste
   stepInfoPtr->step = eDescr->proxyStep.step;
   stepInfoPtr->tsStartUsec = inspectorGetTime();
   inspectorInlineListInit(&stepInfoPtr->states);
-  inspectorLockInit(&stepInfoPtr->guard);
+  inspectorProxyEventLockInit(&stepInfoPtr->guard);
   *stepInfo = stepInfoPtr;
 }
 
 static void inspectorPluginProxyCtrlInfoInit(struct inspectorProxyCtrlInfo **ctrlInfo,
                                              struct inspectorCommInfo *commInfo) {
   struct inspectorProxyCtrlInfo *ctrlInfoPtr =
-    (struct inspectorProxyCtrlInfo*)calloc(1, sizeof(struct inspectorProxyCtrlInfo));
+    inspectorEventPoolAllocProxyCtrl();
   if (ctrlInfoPtr == nullptr) {
     INFO_INSPECTOR("Inspector: Failed to allocate memory for proxy ctrl info structure");
     *ctrlInfo = nullptr;
@@ -687,7 +908,7 @@ static void inspectorPluginProxyCtrlInfoInit(struct inspectorProxyCtrlInfo **ctr
   ctrlInfoPtr->proxyId = __atomic_add_fetch(&commInfo->proxySeqNum, 1, __ATOMIC_RELAXED);
   ctrlInfoPtr->tsStartUsec = inspectorGetTime();
   inspectorInlineListInit(&ctrlInfoPtr->states);
-  inspectorLockInit(&ctrlInfoPtr->guard);
+  inspectorProxyEventLockInit(&ctrlInfoPtr->guard);
   *ctrlInfo = ctrlInfoPtr;
 }
 
@@ -1430,10 +1651,10 @@ static ncclResult_t inspectorPluginStopEventProxyStep(struct inspectorProxyStepI
   memset(&completedParentOp, 0, sizeof(completedParentOp));
   memset(&stepRecord, 0, sizeof(stepRecord));
 
-  inspectorLockWr(&stepInfo->guard);
+  inspectorProxyEventLockWr(&stepInfo->guard);
   stepInfo->tsCompletedUsec = inspectorGetTime();
   inspectorResult_t recordRes = inspectorProxyStepRecordFromStepLocked(&stepRecord, stepInfo);
-  inspectorUnlockRWLock(&stepInfo->guard);
+  inspectorProxyEventUnlock(&stepInfo->guard);
   if (recordRes != inspectorSuccess) {
     INFO_INSPECTOR("Inspector: Failed to copy proxy step record: %s",
                    inspectorErrorString(recordRes));
@@ -1507,11 +1728,11 @@ static ncclResult_t inspectorPluginStopEventProxyCtrl(struct inspectorProxyCtrlI
   struct inspectorCommInfo *commInfo = nullptr;
   inspectorCompletedProxyEventInfoInit(&completedProxy);
 
-  inspectorLockWr(&ctrlInfo->guard);
+  inspectorProxyEventLockWr(&ctrlInfo->guard);
   ctrlInfo->tsCompletedUsec = inspectorGetTime();
   commInfo = ctrlInfo->commInfo;
   inspectorResult_t res = inspectorCompletedProxyFromCtrlLocked(&completedProxy, ctrlInfo);
-  inspectorUnlockRWLock(&ctrlInfo->guard);
+  inspectorProxyEventUnlock(&ctrlInfo->guard);
   if (res != inspectorSuccess) {
     INFO_INSPECTOR("Inspector: Failed to complete proxy ctrl: %s",
                    inspectorErrorString(res));
@@ -1617,10 +1838,10 @@ static ncclResult_t inspectorPluginRecordEventStateProxyStep(struct inspectorPro
     transSize = eStateArgs->proxyStep.transSize;
   }
 
-  inspectorLockWr(&stepInfo->guard);
+  inspectorProxyEventLockWr(&stepInfo->guard);
   inspectorResult_t res = inspectorRecordProxyEventState(&stepInfo->states, eState, eStateArgs);
   stepInfo->transSize += transSize;
-  inspectorUnlockRWLock(&stepInfo->guard);
+  inspectorProxyEventUnlock(&stepInfo->guard);
   if (res != inspectorSuccess) {
     INFO_INSPECTOR("Inspector: Failed to record proxy step state: %s",
                    inspectorErrorString(res));
@@ -1637,9 +1858,9 @@ static ncclResult_t inspectorPluginRecordEventStateProxyStep(struct inspectorPro
 static ncclResult_t inspectorPluginRecordEventStateProxyCtrl(struct inspectorProxyCtrlInfo *ctrlInfo,
                                                              ncclProfilerEventState_t eState,
                                                              ncclProfilerEventStateArgs_t* eStateArgs) {
-  inspectorLockWr(&ctrlInfo->guard);
+  inspectorProxyEventLockWr(&ctrlInfo->guard);
   inspectorResult_t res = inspectorRecordProxyEventState(&ctrlInfo->states, eState, eStateArgs);
-  inspectorUnlockRWLock(&ctrlInfo->guard);
+  inspectorProxyEventUnlock(&ctrlInfo->guard);
   if (res != inspectorSuccess) {
     INFO_INSPECTOR("Inspector: Failed to record proxy ctrl state: %s",
                    inspectorErrorString(res));
@@ -1668,7 +1889,7 @@ static ncclResult_t inspectorPluginRecordEventStateProxyCtrl(struct inspectorPro
  *   ncclResult_t - success or error code.
  *
  */
-__hidden ncclResult_t inspectorPluginStopEvent(void *eHandle) {
+static ncclResult_t inspectorPluginStopEventSync(void *eHandle) {
   if (eHandle == nullptr) {
     INFO(NCCL_INIT,
          "Profiler/Plugin: Event Handle NULL for start event %s", __func__);
@@ -1724,9 +1945,9 @@ __hidden ncclResult_t inspectorPluginStopEvent(void *eHandle) {
  *   ncclResult_t - success or error code.
  *
  */
-__hidden ncclResult_t inspectorPluginRecordEventState(void* eHandle,
-                                                      ncclProfilerEventState_t eState,
-                                                      ncclProfilerEventStateArgs_t* eStateArgs) {
+static ncclResult_t inspectorPluginRecordEventStateSync(void* eHandle,
+                                                        ncclProfilerEventState_t eState,
+                                                        ncclProfilerEventStateArgs_t* eStateArgs) {
   if (eHandle == nullptr)
     return ncclSuccess;
 
@@ -1760,6 +1981,45 @@ __hidden ncclResult_t inspectorPluginRecordEventState(void* eHandle,
 
   }
   return ncclSuccess;
+}
+
+__hidden ncclResult_t inspectorPluginStopEvent(void *eHandle) {
+  if (eHandle == nullptr) {
+    INFO(NCCL_INIT,
+         "Profiler/Plugin: Event Handle NULL for stop event %s", __func__);
+    return ncclSuccess;
+  }
+
+  inspectorAsyncEvent event;
+  memset(&event, 0, sizeof(event));
+  event.type = inspectorAsyncEventStop;
+  event.eHandle = eHandle;
+  if (inspectorPluginAsyncEnqueue(&event)) {
+    return ncclSuccess;
+  }
+  return inspectorPluginStopEventSync(eHandle);
+}
+
+__hidden ncclResult_t inspectorPluginRecordEventState(void* eHandle,
+                                                      ncclProfilerEventState_t eState,
+                                                      ncclProfilerEventStateArgs_t* eStateArgs) {
+  if (eHandle == nullptr) {
+    return ncclSuccess;
+  }
+
+  inspectorAsyncEvent event;
+  memset(&event, 0, sizeof(event));
+  event.type = inspectorAsyncEventRecord;
+  event.eHandle = eHandle;
+  event.eState = eState;
+  event.hasArgs = eStateArgs != nullptr;
+  if (eStateArgs != nullptr) {
+    event.eStateArgs = *eStateArgs;
+  }
+  if (inspectorPluginAsyncEnqueue(&event)) {
+    return ncclSuccess;
+  }
+  return inspectorPluginRecordEventStateSync(eHandle, eState, eStateArgs);
 }
 
 ncclProfiler_t ncclProfiler_v5 = {

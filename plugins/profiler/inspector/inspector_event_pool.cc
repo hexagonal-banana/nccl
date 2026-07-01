@@ -1,6 +1,7 @@
 #include "inspector_event_pool.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 
 // Global event pool
 struct inspectorEventPool g_eventPool;
@@ -332,6 +333,213 @@ static inspectorResult_t growCommPool() {
   return inspectorSuccess;
 }
 
+static inspectorResult_t initProxyOpPool(uint32_t strideSize) {
+  g_eventPool.proxyOpStrideSize = strideSize;
+  g_eventPool.proxyOpTotalSize = 0;
+  g_eventPool.proxyOpAllocCount = 0;
+  g_eventPool.proxyOpChunkCount = 0;
+  g_eventPool.proxyOpChunkList = nullptr;
+  g_eventPool.proxyOpFreeList = nullptr;
+
+  if (pthread_mutex_init(&g_eventPool.proxyOpPoolLock, nullptr) != 0) {
+    return inspectorLockError;
+  }
+
+  struct inspectorPoolChunk* chunk =
+    allocatePoolChunk(sizeof(struct inspectorProxyOpInfoPoolEntry), strideSize);
+  if (chunk == nullptr) {
+    INFO_INSPECTOR("NCCL Inspector: Failed to allocate initial proxy op pool chunk");
+    pthread_mutex_destroy(&g_eventPool.proxyOpPoolLock);
+    return inspectorMemoryError;
+  }
+
+  g_eventPool.proxyOpChunkList = chunk;
+  g_eventPool.proxyOpChunkCount = 1;
+  g_eventPool.proxyOpTotalSize = strideSize;
+
+  struct inspectorProxyOpInfoPoolEntry* entries =
+    (struct inspectorProxyOpInfoPoolEntry*)chunk->entries;
+  g_eventPool.proxyOpFreeList = &entries[0];
+  for (uint32_t i = 0; i < strideSize - 1; i++) {
+    entries[i].next = &entries[i + 1];
+    entries[i].inUse = false;
+  }
+  entries[strideSize - 1].next = nullptr;
+  entries[strideSize - 1].inUse = false;
+
+  INFO_INSPECTOR("NCCL Inspector: Initialized proxy op pool with stride size %u",
+                 strideSize);
+  return inspectorSuccess;
+}
+
+static inspectorResult_t growProxyOpPool() {
+  struct inspectorPoolChunk* newChunk =
+    allocatePoolChunk(sizeof(struct inspectorProxyOpInfoPoolEntry),
+                      g_eventPool.proxyOpStrideSize);
+  if (newChunk == nullptr) {
+    WARN_INSPECTOR("NCCL Inspector: Failed to grow proxy op pool (current chunks: %u, total entries: %u)",
+                   g_eventPool.proxyOpChunkCount, g_eventPool.proxyOpTotalSize);
+    return inspectorMemoryError;
+  }
+
+  newChunk->next = g_eventPool.proxyOpChunkList;
+  g_eventPool.proxyOpChunkList = newChunk;
+  g_eventPool.proxyOpChunkCount++;
+  g_eventPool.proxyOpTotalSize += g_eventPool.proxyOpStrideSize;
+
+  struct inspectorProxyOpInfoPoolEntry* entries =
+    (struct inspectorProxyOpInfoPoolEntry*)newChunk->entries;
+  for (uint32_t i = 0; i < g_eventPool.proxyOpStrideSize - 1; i++) {
+    entries[i].next = &entries[i + 1];
+    entries[i].inUse = false;
+  }
+  entries[g_eventPool.proxyOpStrideSize - 1].next = g_eventPool.proxyOpFreeList;
+  entries[g_eventPool.proxyOpStrideSize - 1].inUse = false;
+  g_eventPool.proxyOpFreeList = &entries[0];
+
+  INFO_INSPECTOR("NCCL Inspector: Grew proxy op pool to %u chunks (%u total entries)",
+                 g_eventPool.proxyOpChunkCount, g_eventPool.proxyOpTotalSize);
+  return inspectorSuccess;
+}
+
+static inspectorResult_t initProxyStepPool(uint32_t strideSize) {
+  g_eventPool.proxyStepStrideSize = strideSize;
+  g_eventPool.proxyStepTotalSize = 0;
+  g_eventPool.proxyStepAllocCount = 0;
+  g_eventPool.proxyStepChunkCount = 0;
+  g_eventPool.proxyStepChunkList = nullptr;
+  g_eventPool.proxyStepFreeList = nullptr;
+
+  if (pthread_mutex_init(&g_eventPool.proxyStepPoolLock, nullptr) != 0) {
+    return inspectorLockError;
+  }
+
+  struct inspectorPoolChunk* chunk =
+    allocatePoolChunk(sizeof(struct inspectorProxyStepInfoPoolEntry), strideSize);
+  if (chunk == nullptr) {
+    INFO_INSPECTOR("NCCL Inspector: Failed to allocate initial proxy step pool chunk");
+    pthread_mutex_destroy(&g_eventPool.proxyStepPoolLock);
+    return inspectorMemoryError;
+  }
+
+  g_eventPool.proxyStepChunkList = chunk;
+  g_eventPool.proxyStepChunkCount = 1;
+  g_eventPool.proxyStepTotalSize = strideSize;
+
+  struct inspectorProxyStepInfoPoolEntry* entries =
+    (struct inspectorProxyStepInfoPoolEntry*)chunk->entries;
+  g_eventPool.proxyStepFreeList = &entries[0];
+  for (uint32_t i = 0; i < strideSize - 1; i++) {
+    entries[i].next = &entries[i + 1];
+    entries[i].inUse = false;
+  }
+  entries[strideSize - 1].next = nullptr;
+  entries[strideSize - 1].inUse = false;
+
+  INFO_INSPECTOR("NCCL Inspector: Initialized proxy step pool with stride size %u",
+                 strideSize);
+  return inspectorSuccess;
+}
+
+static inspectorResult_t growProxyStepPool() {
+  struct inspectorPoolChunk* newChunk =
+    allocatePoolChunk(sizeof(struct inspectorProxyStepInfoPoolEntry),
+                      g_eventPool.proxyStepStrideSize);
+  if (newChunk == nullptr) {
+    WARN_INSPECTOR("NCCL Inspector: Failed to grow proxy step pool (current chunks: %u, total entries: %u)",
+                   g_eventPool.proxyStepChunkCount, g_eventPool.proxyStepTotalSize);
+    return inspectorMemoryError;
+  }
+
+  newChunk->next = g_eventPool.proxyStepChunkList;
+  g_eventPool.proxyStepChunkList = newChunk;
+  g_eventPool.proxyStepChunkCount++;
+  g_eventPool.proxyStepTotalSize += g_eventPool.proxyStepStrideSize;
+
+  struct inspectorProxyStepInfoPoolEntry* entries =
+    (struct inspectorProxyStepInfoPoolEntry*)newChunk->entries;
+  for (uint32_t i = 0; i < g_eventPool.proxyStepStrideSize - 1; i++) {
+    entries[i].next = &entries[i + 1];
+    entries[i].inUse = false;
+  }
+  entries[g_eventPool.proxyStepStrideSize - 1].next = g_eventPool.proxyStepFreeList;
+  entries[g_eventPool.proxyStepStrideSize - 1].inUse = false;
+  g_eventPool.proxyStepFreeList = &entries[0];
+
+  INFO_INSPECTOR("NCCL Inspector: Grew proxy step pool to %u chunks (%u total entries)",
+                 g_eventPool.proxyStepChunkCount, g_eventPool.proxyStepTotalSize);
+  return inspectorSuccess;
+}
+
+static inspectorResult_t initProxyCtrlPool(uint32_t strideSize) {
+  g_eventPool.proxyCtrlStrideSize = strideSize;
+  g_eventPool.proxyCtrlTotalSize = 0;
+  g_eventPool.proxyCtrlAllocCount = 0;
+  g_eventPool.proxyCtrlChunkCount = 0;
+  g_eventPool.proxyCtrlChunkList = nullptr;
+  g_eventPool.proxyCtrlFreeList = nullptr;
+
+  if (pthread_mutex_init(&g_eventPool.proxyCtrlPoolLock, nullptr) != 0) {
+    return inspectorLockError;
+  }
+
+  struct inspectorPoolChunk* chunk =
+    allocatePoolChunk(sizeof(struct inspectorProxyCtrlInfoPoolEntry), strideSize);
+  if (chunk == nullptr) {
+    INFO_INSPECTOR("NCCL Inspector: Failed to allocate initial proxy ctrl pool chunk");
+    pthread_mutex_destroy(&g_eventPool.proxyCtrlPoolLock);
+    return inspectorMemoryError;
+  }
+
+  g_eventPool.proxyCtrlChunkList = chunk;
+  g_eventPool.proxyCtrlChunkCount = 1;
+  g_eventPool.proxyCtrlTotalSize = strideSize;
+
+  struct inspectorProxyCtrlInfoPoolEntry* entries =
+    (struct inspectorProxyCtrlInfoPoolEntry*)chunk->entries;
+  g_eventPool.proxyCtrlFreeList = &entries[0];
+  for (uint32_t i = 0; i < strideSize - 1; i++) {
+    entries[i].next = &entries[i + 1];
+    entries[i].inUse = false;
+  }
+  entries[strideSize - 1].next = nullptr;
+  entries[strideSize - 1].inUse = false;
+
+  INFO_INSPECTOR("NCCL Inspector: Initialized proxy ctrl pool with stride size %u",
+                 strideSize);
+  return inspectorSuccess;
+}
+
+static inspectorResult_t growProxyCtrlPool() {
+  struct inspectorPoolChunk* newChunk =
+    allocatePoolChunk(sizeof(struct inspectorProxyCtrlInfoPoolEntry),
+                      g_eventPool.proxyCtrlStrideSize);
+  if (newChunk == nullptr) {
+    WARN_INSPECTOR("NCCL Inspector: Failed to grow proxy ctrl pool (current chunks: %u, total entries: %u)",
+                   g_eventPool.proxyCtrlChunkCount, g_eventPool.proxyCtrlTotalSize);
+    return inspectorMemoryError;
+  }
+
+  newChunk->next = g_eventPool.proxyCtrlChunkList;
+  g_eventPool.proxyCtrlChunkList = newChunk;
+  g_eventPool.proxyCtrlChunkCount++;
+  g_eventPool.proxyCtrlTotalSize += g_eventPool.proxyCtrlStrideSize;
+
+  struct inspectorProxyCtrlInfoPoolEntry* entries =
+    (struct inspectorProxyCtrlInfoPoolEntry*)newChunk->entries;
+  for (uint32_t i = 0; i < g_eventPool.proxyCtrlStrideSize - 1; i++) {
+    entries[i].next = &entries[i + 1];
+    entries[i].inUse = false;
+  }
+  entries[g_eventPool.proxyCtrlStrideSize - 1].next = g_eventPool.proxyCtrlFreeList;
+  entries[g_eventPool.proxyCtrlStrideSize - 1].inUse = false;
+  g_eventPool.proxyCtrlFreeList = &entries[0];
+
+  INFO_INSPECTOR("NCCL Inspector: Grew proxy ctrl pool to %u chunks (%u total entries)",
+                 g_eventPool.proxyCtrlChunkCount, g_eventPool.proxyCtrlTotalSize);
+  return inspectorSuccess;
+}
+
 /*
  * Description:
  *   Free all chunks in a chunk list.
@@ -380,6 +588,21 @@ static void cleanupPartialPoolInit() {
     freeChunkList(g_eventPool.commChunkList);
     g_eventPool.commChunkList = nullptr;
   }
+  if (g_eventPool.proxyOpChunkList != nullptr) {
+    pthread_mutex_destroy(&g_eventPool.proxyOpPoolLock);
+    freeChunkList(g_eventPool.proxyOpChunkList);
+    g_eventPool.proxyOpChunkList = nullptr;
+  }
+  if (g_eventPool.proxyStepChunkList != nullptr) {
+    pthread_mutex_destroy(&g_eventPool.proxyStepPoolLock);
+    freeChunkList(g_eventPool.proxyStepChunkList);
+    g_eventPool.proxyStepChunkList = nullptr;
+  }
+  if (g_eventPool.proxyCtrlChunkList != nullptr) {
+    pthread_mutex_destroy(&g_eventPool.proxyCtrlPoolLock);
+    freeChunkList(g_eventPool.proxyCtrlChunkList);
+    g_eventPool.proxyCtrlChunkList = nullptr;
+  }
 }
 
 /*
@@ -400,7 +623,10 @@ static void cleanupPartialPoolInit() {
  */
 inspectorResult_t inspectorEventPoolInit(uint32_t collPoolSize,
                                          uint32_t p2pPoolSize,
-                                         uint32_t commPoolSize) {
+                                         uint32_t commPoolSize,
+                                         uint32_t proxyOpPoolSize,
+                                         uint32_t proxyStepPoolSize,
+                                         uint32_t proxyCtrlPoolSize) {
   inspectorResult_t res;
 
   memset(&g_eventPool, 0, sizeof(struct inspectorEventPool));
@@ -426,9 +652,29 @@ inspectorResult_t inspectorEventPoolInit(uint32_t collPoolSize,
     return res;
   }
 
+  res = initProxyOpPool(proxyOpPoolSize);
+  if (res != inspectorSuccess) {
+    cleanupPartialPoolInit();
+    return res;
+  }
+
+  res = initProxyStepPool(proxyStepPoolSize);
+  if (res != inspectorSuccess) {
+    cleanupPartialPoolInit();
+    return res;
+  }
+
+  res = initProxyCtrlPool(proxyCtrlPoolSize);
+  if (res != inspectorSuccess) {
+    cleanupPartialPoolInit();
+    return res;
+  }
+
   INFO_INSPECTOR(
-    "NCCL Inspector: Memory pools initialized (stride-based) - Coll: %u, P2P: %u, Comms: %u, pool grow: %s",
-    collPoolSize, p2pPoolSize, commPoolSize, g_eventPool.growEnabled ? "enabled" : "disabled");
+    "NCCL Inspector: Memory pools initialized (stride-based) - Coll: %u, P2P: %u, Comms: %u, ProxyOp: %u, ProxyStep: %u, ProxyCtrl: %u, pool grow: %s",
+    collPoolSize, p2pPoolSize, commPoolSize, proxyOpPoolSize,
+    proxyStepPoolSize, proxyCtrlPoolSize,
+    g_eventPool.growEnabled ? "enabled" : "disabled");
 
   return inspectorSuccess;
 }
@@ -596,6 +842,96 @@ struct inspectorCommInfo* inspectorEventPoolAllocComm() {
   return &entry->obj;
 }
 
+struct inspectorProxyOpInfo* inspectorEventPoolAllocProxyOp() {
+  pthread_mutex_lock(&g_eventPool.proxyOpPoolLock);
+
+  if (g_eventPool.proxyOpFreeList == nullptr) {
+    if (!g_eventPool.growEnabled) {
+      pthread_mutex_unlock(&g_eventPool.proxyOpPoolLock);
+      WARN_INSPECTOR("NCCL Inspector: Proxy op pool exhausted and pool grow is disabled (NCCL_INSPECTOR_POOL_GROW=0) - allocation failed!");
+      return nullptr;
+    }
+    INFO_INSPECTOR("NCCL Inspector: Proxy op pool exhausted, growing pool (current: %u chunks, %u entries)",
+                   g_eventPool.proxyOpChunkCount, g_eventPool.proxyOpTotalSize);
+    inspectorResult_t res = growProxyOpPool();
+    if (res != inspectorSuccess) {
+      pthread_mutex_unlock(&g_eventPool.proxyOpPoolLock);
+      WARN_INSPECTOR("NCCL Inspector: Failed to grow proxy op pool - allocation failed!");
+      return nullptr;
+    }
+  }
+
+  struct inspectorProxyOpInfoPoolEntry* entry = g_eventPool.proxyOpFreeList;
+  g_eventPool.proxyOpFreeList = entry->next;
+  entry->inUse = true;
+  entry->next = nullptr;
+  g_eventPool.proxyOpAllocCount++;
+  pthread_mutex_unlock(&g_eventPool.proxyOpPoolLock);
+
+  memset(&entry->obj, 0, sizeof(struct inspectorProxyOpInfo));
+  return &entry->obj;
+}
+
+struct inspectorProxyStepInfo* inspectorEventPoolAllocProxyStep() {
+  pthread_mutex_lock(&g_eventPool.proxyStepPoolLock);
+
+  if (g_eventPool.proxyStepFreeList == nullptr) {
+    if (!g_eventPool.growEnabled) {
+      pthread_mutex_unlock(&g_eventPool.proxyStepPoolLock);
+      WARN_INSPECTOR("NCCL Inspector: Proxy step pool exhausted and pool grow is disabled (NCCL_INSPECTOR_POOL_GROW=0) - allocation failed!");
+      return nullptr;
+    }
+    INFO_INSPECTOR("NCCL Inspector: Proxy step pool exhausted, growing pool (current: %u chunks, %u entries)",
+                   g_eventPool.proxyStepChunkCount, g_eventPool.proxyStepTotalSize);
+    inspectorResult_t res = growProxyStepPool();
+    if (res != inspectorSuccess) {
+      pthread_mutex_unlock(&g_eventPool.proxyStepPoolLock);
+      WARN_INSPECTOR("NCCL Inspector: Failed to grow proxy step pool - allocation failed!");
+      return nullptr;
+    }
+  }
+
+  struct inspectorProxyStepInfoPoolEntry* entry = g_eventPool.proxyStepFreeList;
+  g_eventPool.proxyStepFreeList = entry->next;
+  entry->inUse = true;
+  entry->next = nullptr;
+  g_eventPool.proxyStepAllocCount++;
+  pthread_mutex_unlock(&g_eventPool.proxyStepPoolLock);
+
+  memset(&entry->obj, 0, sizeof(struct inspectorProxyStepInfo));
+  return &entry->obj;
+}
+
+struct inspectorProxyCtrlInfo* inspectorEventPoolAllocProxyCtrl() {
+  pthread_mutex_lock(&g_eventPool.proxyCtrlPoolLock);
+
+  if (g_eventPool.proxyCtrlFreeList == nullptr) {
+    if (!g_eventPool.growEnabled) {
+      pthread_mutex_unlock(&g_eventPool.proxyCtrlPoolLock);
+      WARN_INSPECTOR("NCCL Inspector: Proxy ctrl pool exhausted and pool grow is disabled (NCCL_INSPECTOR_POOL_GROW=0) - allocation failed!");
+      return nullptr;
+    }
+    INFO_INSPECTOR("NCCL Inspector: Proxy ctrl pool exhausted, growing pool (current: %u chunks, %u entries)",
+                   g_eventPool.proxyCtrlChunkCount, g_eventPool.proxyCtrlTotalSize);
+    inspectorResult_t res = growProxyCtrlPool();
+    if (res != inspectorSuccess) {
+      pthread_mutex_unlock(&g_eventPool.proxyCtrlPoolLock);
+      WARN_INSPECTOR("NCCL Inspector: Failed to grow proxy ctrl pool - allocation failed!");
+      return nullptr;
+    }
+  }
+
+  struct inspectorProxyCtrlInfoPoolEntry* entry = g_eventPool.proxyCtrlFreeList;
+  g_eventPool.proxyCtrlFreeList = entry->next;
+  entry->inUse = true;
+  entry->next = nullptr;
+  g_eventPool.proxyCtrlAllocCount++;
+  pthread_mutex_unlock(&g_eventPool.proxyCtrlPoolLock);
+
+  memset(&entry->obj, 0, sizeof(struct inspectorProxyCtrlInfo));
+  return &entry->obj;
+}
+
 /*
  * Description:
  *   Release a collective info object back to the pool.
@@ -723,4 +1059,79 @@ void inspectorEventPoolReleaseComm(struct inspectorCommInfo* commInfo) {
   g_eventPool.commAllocCount--;
 
   pthread_mutex_unlock(&g_eventPool.commPoolLock);
+}
+
+void inspectorEventPoolReleaseProxyOp(struct inspectorProxyOpInfo* opInfo) {
+  if (opInfo == nullptr) {
+    return;
+  }
+
+  struct inspectorProxyOpInfoPoolEntry* entry =
+    (struct inspectorProxyOpInfoPoolEntry*)((char*)opInfo -
+                                            offsetof(struct inspectorProxyOpInfoPoolEntry, obj));
+
+  pthread_mutex_lock(&g_eventPool.proxyOpPoolLock);
+
+  if (!entry->inUse) {
+    pthread_mutex_unlock(&g_eventPool.proxyOpPoolLock);
+    WARN_INSPECTOR("NCCL Inspector: Double release detected for proxy op info!");
+    return;
+  }
+
+  entry->inUse = false;
+  entry->next = g_eventPool.proxyOpFreeList;
+  g_eventPool.proxyOpFreeList = entry;
+  g_eventPool.proxyOpAllocCount--;
+
+  pthread_mutex_unlock(&g_eventPool.proxyOpPoolLock);
+}
+
+void inspectorEventPoolReleaseProxyStep(struct inspectorProxyStepInfo* stepInfo) {
+  if (stepInfo == nullptr) {
+    return;
+  }
+
+  struct inspectorProxyStepInfoPoolEntry* entry =
+    (struct inspectorProxyStepInfoPoolEntry*)((char*)stepInfo -
+                                              offsetof(struct inspectorProxyStepInfoPoolEntry, obj));
+
+  pthread_mutex_lock(&g_eventPool.proxyStepPoolLock);
+
+  if (!entry->inUse) {
+    pthread_mutex_unlock(&g_eventPool.proxyStepPoolLock);
+    WARN_INSPECTOR("NCCL Inspector: Double release detected for proxy step info!");
+    return;
+  }
+
+  entry->inUse = false;
+  entry->next = g_eventPool.proxyStepFreeList;
+  g_eventPool.proxyStepFreeList = entry;
+  g_eventPool.proxyStepAllocCount--;
+
+  pthread_mutex_unlock(&g_eventPool.proxyStepPoolLock);
+}
+
+void inspectorEventPoolReleaseProxyCtrl(struct inspectorProxyCtrlInfo* ctrlInfo) {
+  if (ctrlInfo == nullptr) {
+    return;
+  }
+
+  struct inspectorProxyCtrlInfoPoolEntry* entry =
+    (struct inspectorProxyCtrlInfoPoolEntry*)((char*)ctrlInfo -
+                                              offsetof(struct inspectorProxyCtrlInfoPoolEntry, obj));
+
+  pthread_mutex_lock(&g_eventPool.proxyCtrlPoolLock);
+
+  if (!entry->inUse) {
+    pthread_mutex_unlock(&g_eventPool.proxyCtrlPoolLock);
+    WARN_INSPECTOR("NCCL Inspector: Double release detected for proxy ctrl info!");
+    return;
+  }
+
+  entry->inUse = false;
+  entry->next = g_eventPool.proxyCtrlFreeList;
+  g_eventPool.proxyCtrlFreeList = entry;
+  g_eventPool.proxyCtrlAllocCount--;
+
+  pthread_mutex_unlock(&g_eventPool.proxyCtrlPoolLock);
 }
