@@ -1653,7 +1653,8 @@ void inspectorUpdateCollPerf(struct inspectorCompletedOpInfo *completedOp,
   completedOp->algo = collInfo->algo;
   completedOp->proto = collInfo->proto;
   completedOp->evtTrk = collInfo->collEvtTrk;
-  inspectorProxyOpRecordListCopy(&completedOp->proxyOps, &collInfo->proxyOps);
+  // Move ownership: collInfo->proxyOps will be cleaned up after this
+  inspectorInlineListMove(&completedOp->proxyOps, &collInfo->proxyOps);
 }
 
 /*
@@ -1735,7 +1736,8 @@ void inspectorUpdateP2pPerf(struct inspectorCompletedOpInfo *completedOp,
   completedOp->execTimeUsecs =
     calculateMaxKernelExecTimeUsecsP2p(p2pInfo, &completedOp->timingSource);
   completedOp->evtTrk = p2pInfo->p2pEvtTrk;
-  inspectorProxyOpRecordListCopy(&completedOp->proxyOps, &p2pInfo->proxyOps);
+  // Move ownership: p2pInfo->proxyOps will be cleaned up after this
+  inspectorInlineListMove(&completedOp->proxyOps, &p2pInfo->proxyOps);
 }
 
 /*

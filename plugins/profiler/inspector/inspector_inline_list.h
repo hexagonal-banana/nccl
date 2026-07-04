@@ -108,6 +108,22 @@ static inline void inspectorInlineListFree(
   memset(list, 0, sizeof(*list));
 }
 
+/*
+ * Move ownership of list contents from src to dst.
+ * After the move, dst owns all inline entries and overflow blocks;
+ * src is left in a valid empty state (no dangling pointers).
+ * This is O(1) for overflow blocks (pointer transfer) plus a fixed-size
+ * memcpy of the inline array.
+ */
+template<typename T, uint32_t InlineCapacity, uint32_t BlockCapacity>
+static inline void inspectorInlineListMove(
+    inspectorInlineList<T, InlineCapacity, BlockCapacity>* dst,
+    inspectorInlineList<T, InlineCapacity, BlockCapacity>* src) {
+  if (dst == nullptr || src == nullptr) return;
+  *dst = *src;
+  memset(src, 0, sizeof(*src));
+}
+
 template<typename T, uint32_t InlineCapacity, uint32_t BlockCapacity>
 static inline bool inspectorInlineListCopy(
     inspectorInlineList<T, InlineCapacity, BlockCapacity>* dst,
