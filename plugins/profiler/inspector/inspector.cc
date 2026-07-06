@@ -850,7 +850,8 @@ static void showInspectorEnvVars() {
     {"NCCL_INSPECTOR_POOL_GROW", getenv("NCCL_INSPECTOR_POOL_GROW"), "1", "Enable/disable dynamic growth of event pools"},
     {"NCCL_INSPECTOR_REQUIRE_KERNEL_TIMING", getenv("NCCL_INSPECTOR_REQUIRE_KERNEL_TIMING"), "1", "Require GPU-based kernel timing; discard events with CPU-measured timing"},
     {"NCCL_INSPECTOR_ASYNC_ENABLE", getenv("NCCL_INSPECTOR_ASYNC_ENABLE"), "1", "Enable async producer/consumer event processing"},
-    {"NCCL_INSPECTOR_ASYNC_QUEUE_SIZE", getenv("NCCL_INSPECTOR_ASYNC_QUEUE_SIZE"), "262144", "Async event queue capacity"},
+    {"NCCL_INSPECTOR_ASYNC_QUEUE_SIZE", getenv("NCCL_INSPECTOR_ASYNC_QUEUE_SIZE"), "1048576", "Async event queue capacity"},
+    {"NCCL_INSPECTOR_PROXY_MIN_MSG_SIZE", getenv("NCCL_INSPECTOR_PROXY_MIN_MSG_SIZE"), "16777216", "Minimum message size (bytes) for proxy event tracking"},
   };
 
   const int numEnvVars = sizeof(envVars) / sizeof(envVars[0]);
@@ -1261,17 +1262,17 @@ static inspectorResult_t inspectorFillCommInfo(struct inspectorCommInfo* commInf
   INS_CHK(inspectorRingInitWithCallbacks(&commInfo->completedCollRing,
                                          ncclInspectorDumpCollRingSize,
                                          sizeof(struct inspectorCompletedOpInfo),
-                                         inspectorCompletedOpInfoCopy,
+                                         inspectorCompletedOpInfoMove,
                                          inspectorCompletedOpInfoCleanup));
   INS_CHK(inspectorRingInitWithCallbacks(&commInfo->completedP2pRing,
                                          ncclInspectorDumpP2pRingSize,
                                          sizeof(struct inspectorCompletedOpInfo),
-                                         inspectorCompletedOpInfoCopy,
+                                         inspectorCompletedOpInfoMove,
                                          inspectorCompletedOpInfoCleanup));
   INS_CHK(inspectorRingInitWithCallbacks(&commInfo->completedProxyRing,
                                          ncclInspectorDumpProxyRingSize,
                                          sizeof(struct inspectorCompletedProxyEventInfo),
-                                         inspectorCompletedProxyEventInfoCopy,
+                                         inspectorCompletedProxyEventInfoMove,
                                          inspectorCompletedProxyEventInfoCleanup));
 
   // Capture current CUDA device ID and convert to UUID string

@@ -466,8 +466,11 @@ bool inspectorIsDumpVerboseEnabled();
 
 inspectorResult_t inspectorCompletedProxyEventInfoCopy(void* dst,
                                                        const void* src);
+inspectorResult_t inspectorCompletedProxyEventInfoMove(void* dst,
+                                                       const void* src);
 void inspectorCompletedProxyEventInfoCleanup(void* entry);
 inspectorResult_t inspectorCompletedOpInfoCopy(void* dst, const void* src);
+inspectorResult_t inspectorCompletedOpInfoMove(void* dst, const void* src);
 void inspectorCompletedOpInfoCleanup(void* entry);
 inspectorResult_t inspectorProxyOpRecordListAppend(
     inspectorProxyOpRecordList* list,

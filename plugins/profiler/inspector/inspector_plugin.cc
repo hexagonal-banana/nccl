@@ -32,6 +32,9 @@ static std::atomic<uint64_t> gAsyncEnqueueUsleeps{0};
 static std::atomic<uint64_t> gAsyncHandleAllocFails{0};
 static std::atomic<uint64_t> gAsyncHandleReleaseSpins{0};
 
+// Minimum message size for proxy event tracking (default 16MB)
+static uint64_t minProxyMsgSizeBytes = 16ULL * 1024 * 1024;
+
 static int gInitialized;
 
 static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
@@ -131,10 +134,9 @@ static void* inspectorPluginResolveAsyncHandle(void* eHandle) {
 
 static void inspectorPluginResolveDescrParent(ncclProfilerEventDescr_t* eDescr) {
   if (eDescr == nullptr || eDescr->parentObj == nullptr) return;
-  void* realParent = inspectorPluginResolveAsyncHandle(eDescr->parentObj);
-  if (realParent != nullptr) {
-    eDescr->parentObj = realParent;
-  }
+  if (!inspectorPluginIsAsyncHandle(eDescr->parentObj)) return;  // Already a real pointer
+  inspectorAsyncHandle* handle = (inspectorAsyncHandle*)eDescr->parentObj;
+  eDescr->parentObj = handle->realHandle.load(std::memory_order_acquire);  // nullptr if parent was filtered
 }
 
 static inspectorResult_t inspectorPluginAsyncHandlePoolInit(size_t size) {
@@ -210,7 +212,7 @@ static bool inspectorPluginAsyncEnabledFromEnv() {
 
 static size_t inspectorPluginAsyncQueueSizeFromEnv() {
   const char* str = getenv("NCCL_INSPECTOR_ASYNC_QUEUE_SIZE");
-  uint64_t size = str ? strtoull(str, nullptr, 0) : 262144;
+  uint64_t size = str ? strtoull(str, nullptr, 0) : 1048576;
   if (size < 1024) size = 1024;
   if (size > SIZE_MAX) size = SIZE_MAX;
   return (size_t)size;
@@ -240,6 +242,11 @@ static void inspectorPluginProxyStepInfoInit(struct inspectorProxyStepInfo **ste
 static void inspectorPluginProxyCtrlInfoInit(struct inspectorProxyCtrlInfo **ctrlInfo,
                                              struct inspectorCommInfo *commInfo,
                                              uint64_t tsOverride);
+
+static bool inspectorShouldTrackProxyForParent(void* parentObj) {
+  (void)parentObj;
+  return true;  // No filtering — track all proxy events
+}
 
 static void inspectorPluginStartEventConsumer(inspectorAsyncEvent* event) {
   void* realHandle = nullptr;
@@ -349,6 +356,13 @@ static void* inspectorPluginAsyncMain(void* arg) {
 
 static inspectorResult_t inspectorPluginAsyncInit() {
   inspectorPluginAsyncReset();
+
+  // Read proxy message size filter threshold
+  const char* minProxyEnv = getenv("NCCL_INSPECTOR_PROXY_MIN_MSG_SIZE");
+  if (minProxyEnv) {
+    minProxyMsgSizeBytes = strtoull(minProxyEnv, nullptr, 0);
+  }
+
   gAsyncQueue.enabled = inspectorPluginAsyncEnabledFromEnv();
   if (!gAsyncQueue.enabled) {
     INFO_INSPECTOR("NCCL Inspector: async event consumer disabled");
@@ -435,33 +449,30 @@ static bool inspectorPluginAsyncEnqueue(const inspectorAsyncEvent* event) {
   gAsyncEnqueueCalls.fetch_add(1, std::memory_order_relaxed);
 
   size_t tail;
-  uint32_t fullSpins = 0;
+  int spinCount = 0;
   while (true) {
     if (gAsyncQueue.stop.load(std::memory_order_acquire)) {
       return false;
     }
     tail = gAsyncQueue.tail.load(std::memory_order_acquire);
     size_t head = gAsyncQueue.head.load(std::memory_order_acquire);
-    if (tail - head < gAsyncQueue.size &&
-        gAsyncQueue.tail.compare_exchange_weak(tail, tail + 1,
+    if (tail - head >= gAsyncQueue.size) {
+      // Queue full — spin with backoff
+      gAsyncEnqueueSpinEvents.fetch_add(1, std::memory_order_relaxed);
+      if (++spinCount > 1024) {
+        usleep(1);
+        spinCount = 0;
+      } else {
+        sched_yield();
+      }
+      continue;
+    }
+    if (gAsyncQueue.tail.compare_exchange_weak(tail, tail + 1,
                                                std::memory_order_acq_rel,
                                                std::memory_order_acquire)) {
       break;
     }
-    if (fullSpins == 0) {
-      gAsyncEnqueueSpinEvents.fetch_add(1, std::memory_order_relaxed);
-    }
-    gAsyncEnqueueTotalSpins.fetch_add(1, std::memory_order_relaxed);
-    if (++fullSpins < 1024) {
-      sched_yield();
-    } else {
-      gAsyncEnqueueUsleeps.fetch_add(1, std::memory_order_relaxed);
-      usleep(50);
-    }
-  }
-
-  if (gAsyncQueue.stop.load(std::memory_order_acquire)) {
-    return false;
+    // CAS contention — retry immediately
   }
 
   inspectorAsyncSlot* slot = &gAsyncQueue.slots[tail % gAsyncQueue.size];
@@ -883,6 +894,34 @@ inspectorResult_t inspectorCompletedProxyEventInfoCopy(void* dst, const void* sr
   return inspectorSuccess;
 }
 
+inspectorResult_t inspectorCompletedProxyEventInfoMove(void* dst, const void* src) {
+  if (dst == nullptr || src == nullptr) return inspectorMemoryError;
+
+  struct inspectorCompletedProxyEventInfo* dstProxy =
+    (struct inspectorCompletedProxyEventInfo*)dst;
+  struct inspectorCompletedProxyEventInfo* srcProxy =
+    (struct inspectorCompletedProxyEventInfo*)const_cast<void*>(src);
+
+  memset(dstProxy, 0, sizeof(*dstProxy));
+  dstProxy->proxyType = srcProxy->proxyType;
+  dstProxy->proxyId = srcProxy->proxyId;
+  dstProxy->rank = srcProxy->rank;
+  dstProxy->pid = srcProxy->pid;
+  dstProxy->channelId = srcProxy->channelId;
+  dstProxy->peer = srcProxy->peer;
+  dstProxy->nSteps = srcProxy->nSteps;
+  dstProxy->chunkSize = srcProxy->chunkSize;
+  dstProxy->isSend = srcProxy->isSend;
+  dstProxy->step = srcProxy->step;
+  dstProxy->transSize = srcProxy->transSize;
+  dstProxy->tsStartUsec = srcProxy->tsStartUsec;
+  dstProxy->tsCompletedUsec = srcProxy->tsCompletedUsec;
+  // Move ownership of states and steps (O(1) pointer transfer)
+  inspectorProxyEventStateListMove(&dstProxy->states, &srcProxy->states);
+  inspectorInlineListMove(&dstProxy->steps, &srcProxy->steps);
+  return inspectorSuccess;
+}
+
 inspectorResult_t inspectorProxyOpRecordListAppend(
     inspectorProxyOpRecordList* list,
     const struct inspectorCompletedProxyEventInfo* record) {
@@ -992,6 +1031,31 @@ inspectorResult_t inspectorCompletedOpInfoCopy(void* dst, const void* src) {
   return inspectorSuccess;
 }
 
+inspectorResult_t inspectorCompletedOpInfoMove(void* dst, const void* src) {
+  if (dst == nullptr || src == nullptr) return inspectorMemoryError;
+
+  struct inspectorCompletedOpInfo* dstOp = (struct inspectorCompletedOpInfo*)dst;
+  struct inspectorCompletedOpInfo* srcOp =
+    (struct inspectorCompletedOpInfo*)const_cast<void*>(src);
+
+  memset(dstOp, 0, sizeof(*dstOp));
+  dstOp->isP2p = srcOp->isP2p;
+  dstOp->func = srcOp->func;
+  dstOp->sn = srcOp->sn;
+  dstOp->msgSizeBytes = srcOp->msgSizeBytes;
+  dstOp->execTimeUsecs = srcOp->execTimeUsecs;
+  dstOp->timingSource = srcOp->timingSource;
+  dstOp->algoBwGbs = srcOp->algoBwGbs;
+  dstOp->busBwGbs = srcOp->busBwGbs;
+  dstOp->algo = srcOp->algo;
+  dstOp->proto = srcOp->proto;
+  dstOp->peer = srcOp->peer;
+  dstOp->evtTrk = srcOp->evtTrk;
+  // Move ownership of proxyOps list (O(1) pointer transfer)
+  inspectorProxyOpRecordListMove(&dstOp->proxyOps, &srcOp->proxyOps);
+  return inspectorSuccess;
+}
+
 static void inspectorCompletedProxyEventInfoInit(
     struct inspectorCompletedProxyEventInfo* proxy) {
   if (proxy == nullptr) return;
@@ -1005,6 +1069,37 @@ static inspectorResult_t inspectorRecordProxyEventState(inspectorProxyEventState
                                            ncclProfilerEventStateArgs_t* eStateArgs,
                                            uint64_t tsOverride = 0) {
   if (states == nullptr) return inspectorMemoryError;
+
+  // State compression: if last recorded state has the same enum value,
+  // update its data fields instead of appending a new entry.
+  if (states->count > 0) {
+    struct inspectorProxyEventStateInfo* last =
+        inspectorInlineListGetMutable(states, states->count - 1);
+    if (last != nullptr && last->state == (int)eState) {
+      // Same state repeating — update data fields, skip allocation
+      switch (eState) {
+      case ncclProfilerProxyStepSendWait:
+      case ncclProfilerProxyStepRecvFlushWait:
+        if (eStateArgs != nullptr) {
+          last->transSize = eStateArgs->proxyStep.transSize;
+        }
+        break;
+      case ncclProfilerProxyCtrlIdle:
+      case ncclProfilerProxyCtrlActive:
+      case ncclProfilerProxyCtrlSleep:
+      case ncclProfilerProxyCtrlWakeup:
+      case ncclProfilerProxyCtrlAppend:
+      case ncclProfilerProxyCtrlAppendEnd:
+        if (eStateArgs != nullptr) {
+          last->appendedProxyOps = eStateArgs->proxyCtrl.appendedProxyOps;
+        }
+        break;
+      default:
+        break;
+      }
+      return inspectorSuccess;
+    }
+  }
 
   struct inspectorProxyEventStateInfo* state = inspectorInlineListAppend(states);
   if (state == nullptr) return inspectorMemoryError;
@@ -1598,18 +1693,21 @@ static ncclResult_t inspectorPluginStartEventSync(void* context,
     *eHandle = kernelChEvent;
   } else if (eDescr->type == ncclProfileProxyOp) {
     if (!enableNcclInspectorProxy || !inspectorIsDumpVerboseEnabled()) return ncclSuccess;
+    if (!inspectorShouldTrackProxyForParent(eDescr->parentObj)) return ncclSuccess;
     struct inspectorProxyOpInfo *proxyOpEvent = nullptr;
     struct inspectorCommInfo *commInfoCtx = (struct inspectorCommInfo*)context;
     inspectorPluginProxyOpInfoInit(&proxyOpEvent, eDescr, commInfoCtx);
     *eHandle = proxyOpEvent;
   } else if (eDescr->type == ncclProfileProxyStep) {
     if (!enableNcclInspectorProxy || !inspectorIsDumpVerboseEnabled()) return ncclSuccess;
+    if (eDescr->parentObj == nullptr) return ncclSuccess;  // Parent ProxyOp was filtered
     struct inspectorProxyStepInfo *proxyStepEvent = nullptr;
     struct inspectorCommInfo *commInfoCtx = (struct inspectorCommInfo*)context;
     inspectorPluginProxyStepInfoInit(&proxyStepEvent, eDescr, commInfoCtx);
     *eHandle = proxyStepEvent;
   } else if (eDescr->type == ncclProfileProxyCtrl) {
     if (!enableNcclInspectorProxy || !inspectorIsDumpVerboseEnabled()) return ncclSuccess;
+    if (eDescr->parentObj == nullptr) return ncclSuccess;  // Parent was filtered
     struct inspectorProxyCtrlInfo *proxyCtrlEvent = nullptr;
     struct inspectorCommInfo *commInfoCtx = (struct inspectorCommInfo*)context;
     inspectorPluginProxyCtrlInfoInit(&proxyCtrlEvent, commInfoCtx);
@@ -1631,7 +1729,8 @@ static bool inspectorPluginShouldTrackStartEvent(ncclProfilerEventDescr_t* eDesc
   } else if (eDescr->type == ncclProfileProxyOp ||
              eDescr->type == ncclProfileProxyStep ||
              eDescr->type == ncclProfileProxyCtrl) {
-    return enableNcclInspectorProxy && inspectorIsDumpVerboseEnabled();
+    if (!enableNcclInspectorProxy || !inspectorIsDumpVerboseEnabled()) return false;
+    return true;
   }
   return false;
 }
@@ -1669,6 +1768,7 @@ __hidden ncclResult_t inspectorPluginStartEvent(void* context,
     }
   }
 
+  // Async not available or enqueue failed — use synchronous path
   return inspectorPluginStartEventSync(context, eHandle, eDescr);
 }
 
@@ -1875,10 +1975,10 @@ static inspectorResult_t inspectorProxyStepRecordFromStepLocked(
 
 static inspectorResult_t inspectorProxyOpAppendStepRecordLocked(
     struct inspectorProxyOpInfo* opInfo,
-    const struct inspectorProxyStepRecordInfo* record) {
+    struct inspectorProxyStepRecordInfo* record) {
   if (opInfo == nullptr || record == nullptr) return inspectorMemoryError;
 
-  return inspectorProxyStepRecordListAppend(&opInfo->steps, record);
+  return inspectorProxyStepRecordListAppendMove(&opInfo->steps, record);
 }
 
 static inspectorResult_t inspectorPluginAppendCompletedProxyToParent(
@@ -2382,7 +2482,8 @@ __hidden ncclResult_t inspectorPluginStopEvent(void *eHandle) {
   if (inspectorPluginAsyncEnqueue(&event)) {
     return ncclSuccess;
   }
-  return inspectorPluginStopEventSync(eHandle);
+  // Async not available — use synchronous path
+  return inspectorPluginStopEventSync(eHandle, 0);
 }
 
 __hidden ncclResult_t inspectorPluginRecordEventState(void* eHandle,
@@ -2405,6 +2506,7 @@ __hidden ncclResult_t inspectorPluginRecordEventState(void* eHandle,
   if (inspectorPluginAsyncEnqueue(&event)) {
     return ncclSuccess;
   }
+  // Async not available — use synchronous path
   return inspectorPluginRecordEventStateSync(eHandle, eState, eStateArgs);
 }
 
