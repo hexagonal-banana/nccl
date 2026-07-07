@@ -9,6 +9,7 @@
 #include "profiler.h"
 #include "inspector_prom.h"
 #include "inspector_json.h"
+#include "inspector_trace.h"
 #include "inspector_cudawrap.h"
 
 #include <assert.h>
@@ -646,6 +647,8 @@ inspectorResult_t inspectorDumpThread::inspectorStateDumpJSON(const char* output
       return inspectorFileOpenError;
     }
     chmod(tmp, 0666);
+    // Remember the log path so it can be converted to a Chrome trace at teardown.
+    snprintf(logFilePath, sizeof(logFilePath), "%s", tmp);
   }
 
   if (jfo != nullptr) {
@@ -1670,12 +1673,48 @@ void inspectorUpdateP2pPerf(struct inspectorCompletedOpInfo *completedOp,
  *   inspectorResult_t - success or error code.
  *
  */
+/*
+ * Description:
+ *
+ *   Derives the Chrome trace output path from a log file path (replacing
+ *   a trailing ".log" with ".trace.json") and converts it. Each inspector
+ *   process only converts the single log file it produced.
+ *
+ * Return:
+ *   None.
+ */
+static void inspectorConvertOwnLog(const char* logPath) {
+  if (logPath == nullptr || logPath[0] == '\0') {
+    return;
+  }
+  if (enableNcclInspectorPromDump) {
+    return;  // Chrome trace conversion only applies to JSON dumps.
+  }
+  char tracePath[2080];
+  size_t len = strlen(logPath);
+  const char* suffix = ".log";
+  const size_t suffixLen = 4;
+  if (len > suffixLen && strcmp(logPath + len - suffixLen, suffix) == 0) {
+    snprintf(tracePath, sizeof(tracePath), "%.*s.trace.json",
+             (int)(len - suffixLen), logPath);
+  } else {
+    snprintf(tracePath, sizeof(tracePath), "%s.trace.json", logPath);
+  }
+  inspectorResult_t res = inspectorConvertLogToChromeTrace(logPath, tracePath);
+  if (res != inspectorSuccess) {
+    INFO_INSPECTOR("NCCL Inspector: Chrome trace conversion failed for %s: %s",
+                   logPath, inspectorErrorString(res));
+  }
+}
+
 inspectorResult_t inspectorGlobalFinalize() {
   // Cleanup CUDA wrapper
   inspectorCudaWrapCleanup();
+  char logPath[2048] = {0};
   if (dumper) {
     dumper->stopThread();
     dumper->inspectorStateDump(dumper->outputRoot);
+    snprintf(logPath, sizeof(logPath), "%s", dumper->logFilePath);
     delete dumper;
     dumper = nullptr;
   } else if (enableNcclInspector) {
@@ -1685,6 +1724,7 @@ inspectorResult_t inspectorGlobalFinalize() {
       if (ensureDir(dumpdir)) {
         inspectorDumpThread finalDumper(dumpdir, -1);
         finalDumper.inspectorStateDump(dumpdir);
+        snprintf(logPath, sizeof(logPath), "%s", finalDumper.logFilePath);
       } else {
         INFO_INSPECTOR("NCCL Inspector: failed to generate a dump dir during finalize");
       }
@@ -1693,5 +1733,9 @@ inspectorResult_t inspectorGlobalFinalize() {
   }
   inspectorCommInfoListFinalize(&g_state.liveComms);
   inspectorCommInfoListFinalize(&g_state.deletedComms);
+
+  // The log file is now fully written and closed; convert it to a
+  // Chrome trace JSON that Perfetto / chrome://tracing can load.
+  inspectorConvertOwnLog(logPath);
   return inspectorSuccess;
 }

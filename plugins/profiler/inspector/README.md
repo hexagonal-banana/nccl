@@ -5,7 +5,6 @@ The NCCL Inspector is a plugin for the NVIDIA Collective Communications Library 
 ## Related Documentation
 
 - **[Performance Exporter](exporter/example/README.md)** - Tool for analyzing and visualizing NCCL performance data from inspector logs
-- **[Grafana Dashboard Template](grafana/README.md)** - Grafana dashboard for visualizing NCCL Inspector job performance metrics via Prometheus
 
 ## Folder Location
 
@@ -74,34 +73,42 @@ export NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS=500
 
 ### Optional Environment Variables
 
+The variables below are read by the current (refactored) plugin. They are grouped by purpose.
+
+**Event tracking**
+
 - `NCCL_INSPECTOR_ENABLE_P2P=<0|1>` (default: `1`)
-  Enables or disables P2P tracking.
+  Enables or disables point-to-point (Send/Recv) tracking.
 - `NCCL_INSPECTOR_ENABLE_PROXY=<0|1>` (default: `1`)
-  Enables or disables proxy event tracking. Proxy events are captured and written only when verbose JSON output is enabled with `NCCL_INSPECTOR_DUMP_VERBOSE=1`.
-- `NCCL_INSPECTOR_DUMP_THREAD_ENABLE=<0|1>` (default: `1`)
-  Enables or disables the internal dump thread.
-- `NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS=<interval>` (default: `-1`)
-  Sets the interval (in microseconds) for the internal dump thread to write output. A value of `-1` (default) disables periodic dumping — output is written only at communicator teardown/finalization. A value of `0` enables continuous dumping (dumps as fast as possible). Set to a positive value to enable periodic dumps at the specified interval (e.g., `500` for every 500 µs). When Prometheus mode is enabled (`NCCL_INSPECTOR_PROM_DUMP=1`), a minimum of `30000000` (30 seconds) is enforced to align with the node exporter polling interval.
-- `NCCL_INSPECTOR_DUMP_DIR=<output_dir>`
-  Sets the output directory for logs. If not set, defaults to `nccl-inspector-unknown-jobid` or `nccl-inspector-<slurm_job_id>` if running under SLURM.
-- `NCCL_INSPECTOR_DUMP_VERBOSE=<0|1>` (default: `0`)
-  Enables verbose output including event trace information and the nested profiler event tree for child profiler events.
-- `NCCL_INSPECTOR_PROM_DUMP=<0|1>` (default: `0`)
-  Enables Prometheus format for textfile node exporter output instead of custom JSON.
+  Enables or disables proxy event tracking (`ProxyOp`/`ProxyStep`/`ProxyCtrl`). Proxy events are written only when verbose output is also enabled with `NCCL_INSPECTOR_DUMP_VERBOSE=1`.
+- `NCCL_INSPECTOR_PROXY_MIN_MSG_SIZE=<bytes>` (default: `16777216`)
+  Minimum message size (bytes) for proxy event tracking. Smaller messages are not tracked.
+- `NCCL_INSPECTOR_REQUIRE_KERNEL_TIMING=<0|1>` (default: `1`)
+  When enabled (default), only events with GPU-based kernel timing (`kernel_gpu`) are recorded. Events that fall back to CPU-measured timing (`kernel_cpu` or `collective_cpu`) are silently discarded. Set to `0` to retain all events regardless of timing source.
 - `NCCL_INSPECTOR_DUMP_MIN_SIZE_BYTES=<bytes>` (default: `8192`)
-  Minimum message size (bytes) to be tracked by inspector.
+  Minimum collective/P2P message size (bytes) to be tracked by inspector.
+
+**Dump thread and output**
+
+- `NCCL_INSPECTOR_DUMP_THREAD_ENABLE=<0|1>` (default: `1`)
+  Enables or disables the internal dump thread that writes output to disk.
+- `NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS=<interval>` (default: `-1`)
+  Sets the interval (in microseconds) for the dump thread to write output. A value of `-1` (default) dumps only at communicator teardown/finalization. A value of `0` enables continuous dumping (dumps as fast as possible). A positive value enables periodic dumps at the specified interval (e.g., `500` for every 500 µs).
+- `NCCL_INSPECTOR_DUMP_DIR=<output_dir>`
+  Sets the output directory for logs. If not set, defaults to `nccl-inspector-<slurm_job_id>` when running under SLURM, otherwise `nccl-inspector-unknown-jobid`.
+- `NCCL_INSPECTOR_DUMP_VERBOSE=<0|1>` (default: `0`)
+  Enables verbose output including event-trace timestamps/sequence numbers and the nested child-event tree (`KernelCh`, proxy events) under each collective/P2P record. Also required for standalone proxy event records to be written.
+
+**Buffer sizing (advanced)**
+
+- `NCCL_INSPECTOR_ASYNC_QUEUE_SIZE=<entries>` (default: `1048576`)
+  Capacity of the async event queue used by the consumer thread (async mode is always enabled). Clamped to a minimum of `1024`.
 - `NCCL_INSPECTOR_DUMP_COLL_RING_SIZE=<entries>` (default: `1024`)
   Per-communicator completed-collective ring buffer capacity.
 - `NCCL_INSPECTOR_DUMP_P2P_RING_SIZE=<entries>` (default: `1024`)
   Per-communicator completed-P2P ring buffer capacity.
-- `NCCL_INSPECTOR_COLL_POOL_SIZE=<entries>` (default: `256`)
-  Collective pool initial size/stride.
-- `NCCL_INSPECTOR_P2P_POOL_SIZE=<entries>` (default: `256`)
-  P2P pool initial size/stride.
-- `NCCL_INSPECTOR_COMM_POOL_SIZE=<entries>` (default: `256`)
-  Comm pool initial size/stride.
-- `NCCL_INSPECTOR_REQUIRE_KERNEL_TIMING=<0|1>` (default: `1`)
-  When enabled (default), only events with GPU-based kernel timing (`kernel_gpu`) are recorded. Events that fall back to CPU-measured timing (`kernel_cpu` or `collective_cpu`) are silently discarded. Set to `0` to restore the previous fallback behaviour and retain all events regardless of timing source.
+- `NCCL_INSPECTOR_DUMP_PROXY_RING_SIZE=<entries>` (default: `8192`)
+  Per-communicator completed-proxy-event ring buffer capacity.
 
 ### Debugging
 
@@ -124,7 +131,7 @@ export NCCL_DEBUG_SUBSYS=ALL
 Inspector messages will appear with your configured NCCL_DEBUG level and will show:
 - Plugin initialization and configuration
 - Dump thread status and intervals
-- File creation and locations (with device UUIDs for Prometheus mode)
+- File creation and locations
 - Error conditions and warnings
 
 ### Example Usage
@@ -149,40 +156,21 @@ export NCCL_INSPECTOR_DUMP_DIR=/path/to/logs/${SLURM_JOB_ID}/
 srun your_nccl_application
 ```
 
-**Prometheus Output Mode (for node exporter)**
+## JSON Dump Files
 
-**Example Prometheus Setup:**
-```bash
-export NCCL_PROFILER_PLUGIN=/path/to/nccl/plugins/profiler/inspector/libnccl-profiler-inspector.so
-export NCCL_INSPECTOR_ENABLE=1
-export NCCL_INSPECTOR_PROM_DUMP=1
-export NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS=30000000  # 30 seconds
-export NCCL_INSPECTOR_DUMP_DIR=/var/lib/node_exporter/nccl_inspector/
-```
+The inspector writes one log file per process into the dump directory, named `<hostname>-pid<pid>.log`. Each line is a self-contained JSON object (newline-delimited JSON) describing a single completed operation or event. Every object begins with two common blocks:
 
-Note: Prometheus mode enforces a minimum dump interval of 30 seconds (30,000,000 microseconds) to align with the node exporter polling interval.
+- `header`: communicator context — `id` (communicator hash), `comm_name`, `rank`, `n_ranks`, `nnodes`.
+- `metadata`: `inspector_output_format_version` (currently `v4.1`), `git_rev`, `rec_mechanism`, `dump_timestamp_us`, `hostname`, `pid`.
 
-**Exported Metrics:**
-- `nccl_bus_bandwidth_gbs` - NCCL bus bandwidth in GB/s (collectives)
-- `nccl_collective_exec_time_microseconds` - Execution time in microseconds (collectives)
-- `nccl_p2p_bus_bandwidth_gbs` - NCCL P2P bus bandwidth in GB/s
-- `nccl_p2p_exec_time_microseconds` - P2P execution time in microseconds
+After the common blocks, each record carries exactly one payload key identifying its type:
 
-When P2P tracking is enabled (`NCCL_INSPECTOR_ENABLE_P2P=1`), Prometheus output includes P2P metrics with a `p2p_operation` label (e.g., `Send`, `Recv`).
+- `coll_perf`: a completed collective (e.g., AllReduce). Fields include `coll`, `coll_sn`, `coll_msg_size_bytes`, `coll_exec_time_us`, `coll_timing_source`, `coll_algobw_gbs`, `coll_busbw_gbs`.
+- `p2p_perf`: a completed point-to-point operation. Fields include `p2p`, `p2p_sn`, `p2p_peer`, `p2p_msg_size_bytes`, `p2p_exec_time_us`, `p2p_timing_source`, `p2p_algobw_gbs`, `p2p_busbw_gbs`.
+- `proxy_op` / `proxy_step` / `proxy_ctrl`: standalone network proxy events. Written only when `NCCL_INSPECTOR_DUMP_VERBOSE=1` and `NCCL_INSPECTOR_ENABLE_PROXY=1`.
+- Generic profiler events, one key each: `group`, `group_api`, `coll_api`, `p2p_api`, `kernel_launch`, `net_plugin`. These are always captured (independent of verbose mode) and carry `start_ts`, `stop_ts`, `duration_us`, `rank` plus type-specific fields (e.g., `coll_api` adds `func`, `count`, `datatype`, `graph_captured`, `root`; `group_api` adds `group_depth`, `graph_captured`; `net_plugin` adds `net_plugin_id`).
 
-**Labels:**
-- Collectives: `version`, `slurm_job_id`, `node`, `gpu`, `comm_name`, `n_nodes`, `nranks`, `collective`, `message_size`, `algo_proto`
-- P2P: `version`, `slurm_job_id`, `node`, `gpu`, `comm_name`, `n_nodes`, `nranks`, `p2p_operation`, `message_size`
-
-`message_size` is a bucketed range string (for example `4-5GB`).
-
-**Current Metric Format Examples:**
-```
-nccl_bus_bandwidth_gbs{version="v5.1",slurm_job_id="unknown",node="nvl72004-T01",gpu="GPU0",comm_name="DP Group 0",n_nodes="1",nranks="4",collective="AllReduce",message_size="4-5GB",algo_proto="Ring_ll"} 678.263
-nccl_collective_exec_time_microseconds{version="v5.1",slurm_job_id="unknown",node="nvl72004-T01",gpu="GPU0",comm_name="DP Group 0",n_nodes="1",nranks="4",collective="AllReduce",message_size="4-5GB",algo_proto="Ring_ll"} 9498.47
-nccl_p2p_bus_bandwidth_gbs{version="v5.1",slurm_job_id="unknown",node="nvl72004-T01",gpu="GPU0",comm_name="DP Group 0",n_nodes="1",nranks="4",p2p_operation="Send",message_size="512-513MB"} 464.9
-nccl_p2p_exec_time_microseconds{version="v5.1",slurm_job_id="unknown",node="nvl72004-T01",gpu="GPU0",comm_name="DP Group 0",n_nodes="1",nranks="4",p2p_operation="Send",message_size="512-513MB"} 1154.87
-```
+When `NCCL_INSPECTOR_DUMP_VERBOSE=1`, `coll_perf` and `p2p_perf` records additionally embed `event_trace_sn`, `event_trace_ts`, and a nested `events` array holding the operation's child `KernelCh` and proxy events.
 
 ## Output Example
 
@@ -326,29 +314,17 @@ Multiple such JSON objects are written, one per collective operation per communi
   - `nccl-inspector-<jobid>` if `SLURM_JOBID` is set
   - `nccl-inspector-unknown-jobid` otherwise
 - You can override this with the `NCCL_INSPECTOR_DUMP_DIR` environment variable.
-- For Prometheus integration, set it to a directory where Prometheus exporter can scrape it from (e.g., `NCCL_INSPECTOR_DUMP_DIR=/var/lib/node_exporter/nccl_inspector`).
 
 ## Output File Size Estimates
 
-The size of output files depends on the output format and usage patterns:
-
-**JSON Mode** (`NCCL_INSPECTOR_PROM_DUMP=0`, default):
 - File size **grows continuously** throughout the application lifetime
-- Each collective operation adds a new JSON entry to the log file
+- Each completed operation adds a new JSON line to the log file
 - File size is proportional to:
-  - Total number of collective operations executed
+  - Total number of collective/P2P operations executed
   - Number of parallel/overlapping communicators the process (PID) participates in
-- Estimate: ~200-500 bytes per collective operation
+  - Whether verbose mode is enabled (verbose records are significantly larger)
+- Estimate: ~200-500 bytes per operation (non-verbose)
 - Example: A workload with 1M collectives across 4 communicators ≈ 200-500 MB per process
-
-**Prometheus Mode** (`NCCL_INSPECTOR_PROM_DUMP=1`):
-- File size is **bounded** (does not grow indefinitely)
-- Files are rewritten periodically (default: every 30 seconds based on `NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS`)
-- File size is proportional to:
-  - Number of parallel/overlapping communicators using the same GPU device
-- Each file contains only the most recent metrics snapshot
-- Estimate: ~500-1000 bytes per communicator per metric
-- Example: 8 communicators on one GPU with 3 metrics ≈ 12-24 KB per GPU (fixed size)
 
 ## Additional Notes
 

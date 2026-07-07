@@ -292,6 +292,7 @@ struct inspectorDumpThread {
   jsonFileOutput* jfo;
   char* outputRoot;
   int64_t sampleIntervalUsecs;
+  char logFilePath[2048] = {0};   // Path of the JSON log file this thread writes
   std::unordered_map<std::string, deviceFlushInfo> deviceFlushMap;
   pthread_t pthread;
   pthread_rwlock_t guard;

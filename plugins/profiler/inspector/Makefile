@@ -62,6 +62,7 @@ endif
 # Source files
 SRCS := inspector.cc \
 	inspector_json.cc \
+	inspector_trace.cc \
 	inspector_prom.cc \
 	inspector_plugin.cc \
 	inspector_cudawrap.cc \
