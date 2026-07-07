@@ -8,7 +8,6 @@
 #include "inspector_prom.h"
 #include "inspector.h"
 #include "inspector_cudawrap.h"
-#include "inspector_ring.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -92,9 +91,6 @@ static const int kInspectorPromFormatMinor = 1;
 
 static void inspectorPromCompletedOpVectorCleanup(
     std::vector<inspectorCompletedOpInfo>& ops) {
-  for (size_t i = 0; i < ops.size(); i++) {
-    inspectorCompletedOpInfoCleanup(&ops[i]);
-  }
   ops.clear();
 }
 
@@ -565,13 +561,8 @@ static inspectorResult_t inspectorPromCommInfoDumpColl(struct inspectorCommInfo*
 
   inspectorLockWr(&commInfo->guard);
   if (commInfo->dump_coll) {
-    if (commInfo->completedCollRing.size > 0
-        && drainedColl.capacity() < commInfo->completedCollRing.size) {
-      drainedColl.reserve(commInfo->completedCollRing.size);
-    }
-    INS_CHK(inspectorRingDrain<inspectorCompletedOpInfo>(&commInfo->completedCollRing,
-                                                        drainedColl));
-    commInfo->dump_coll = inspectorRingNonEmpty(&commInfo->completedCollRing);
+    drainedColl = commInfo->completedCollRing.drain();
+    commInfo->dump_coll = commInfo->completedCollRing.nonEmpty();
   }
   inspectorUnlockRWLock(&commInfo->guard);
 
@@ -617,13 +608,8 @@ static inspectorResult_t inspectorPromCommInfoDumpP2p(struct inspectorCommInfo* 
 
   inspectorLockWr(&commInfo->guard);
   if (commInfo->dump_p2p) {
-    if (commInfo->completedP2pRing.size > 0
-        && drainedP2p.capacity() < commInfo->completedP2pRing.size) {
-      drainedP2p.reserve(commInfo->completedP2pRing.size);
-    }
-    INS_CHK(inspectorRingDrain<inspectorCompletedOpInfo>(&commInfo->completedP2pRing,
-                                                        drainedP2p));
-    commInfo->dump_p2p = inspectorRingNonEmpty(&commInfo->completedP2pRing);
+    drainedP2p = commInfo->completedP2pRing.drain();
+    commInfo->dump_p2p = commInfo->completedP2pRing.nonEmpty();
   }
   inspectorUnlockRWLock(&commInfo->guard);
 
@@ -680,9 +666,7 @@ static inspectorResult_t inspectorPromFillDeviceBuckets(struct inspectorCommInfo
   }
   *processedOut = 0;
 
-  for (struct inspectorCommInfo* itr = commList->comms;
-       itr != nullptr;
-       itr = itr->next) {
+  for (auto* itr : commList->comms) {
     bool needs_writing;
 
     std::string deviceKey(itr->deviceUuidStr);
@@ -785,7 +769,7 @@ inspectorResult_t inspectorPromCommInfoListDump(struct inspectorCommInfoList* co
   INS_CHK(inspectorLockRd(&commList->guard));
   inspectorResult_t res = inspectorSuccess;
 
-  if (commList->ncomms > 0) {
+  if (commList->comms.size() > 0) {
     uint32_t processed = 0;
     uint64_t currentTime = inspectorGetTime();
     std::map<std::string, inspectorPromDevice> devices;
@@ -800,8 +784,8 @@ inspectorResult_t inspectorPromCommInfoListDump(struct inspectorCommInfoList* co
                                                  dumpThread),
                  res, exit);
     TRACE_INSPECTOR(
-      "NCCL Inspector: Completed dump across devices, flushed %u/%u communicators",
-      processed, commList->ncomms);
+      "NCCL Inspector: Completed dump across devices, flushed %u/%zu communicators",
+      processed, commList->comms.size());
   }
 
 exit:

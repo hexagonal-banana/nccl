@@ -14,19 +14,14 @@
 #include <string.h>
 #include <sys/types.h>
 #include <vector>
+#include <string>
+#include <unordered_map>
 
 #include "json.h"
 #include "common.h"
-#include "inspector_inline_list.h"
 #include "version.h"
 
 #define MAX_CHANNELS                     64
-#define MAX_PROXY_EVENT_STATES          8
-#define MAX_PROXY_OP_INLINE_CHILDREN    64
-#define MAX_PROXY_OP_INLINE_STEPS       32
-#define PROXY_EVENT_STATE_BLOCK_SIZE    8
-#define PROXY_OP_CHILD_BLOCK_SIZE       64
-#define PROXY_OP_STEP_BLOCK_SIZE        32
 
 // Bump when ncclProfiler_t alias changes to a new interface version.
 #define NCCL_PROFILER_INTERFACE_VERSION 5
@@ -159,10 +154,8 @@ struct inspectorProxyEventStateInfo {
   int appendedProxyOps;
 };
 
-typedef inspectorInlineList<struct inspectorProxyEventStateInfo,
-                            MAX_PROXY_EVENT_STATES,
-                            PROXY_EVENT_STATE_BLOCK_SIZE>
-  inspectorProxyEventStateList;
+// STL-based type aliases (replacing inspectorInlineList)
+using inspectorProxyEventStateList = std::vector<inspectorProxyEventStateInfo>;
 
 struct inspectorProxyStepRecordInfo {
   int rank;
@@ -179,10 +172,12 @@ struct inspectorProxyStepRecordInfo {
   inspectorProxyEventStateList states;
 };
 
-typedef inspectorInlineList<struct inspectorProxyStepRecordInfo,
-                            MAX_PROXY_OP_INLINE_STEPS,
-                            PROXY_OP_STEP_BLOCK_SIZE>
-  inspectorProxyStepRecordList;
+using inspectorProxyStepRecordList = std::vector<inspectorProxyStepRecordInfo>;
+
+// Forward declaration for circular reference
+struct inspectorCompletedProxyEventInfo;
+
+using inspectorProxyOpRecordList = std::vector<inspectorCompletedProxyEventInfo>;
 
 struct inspectorCompletedProxyEventInfo {
   inspectorProxyEventType_t proxyType;
@@ -202,14 +197,24 @@ struct inspectorCompletedProxyEventInfo {
   inspectorProxyStepRecordList steps;
 };
 
-typedef inspectorInlineList<struct inspectorCompletedProxyEventInfo,
-                            MAX_PROXY_OP_INLINE_CHILDREN,
-                            PROXY_OP_CHILD_BLOCK_SIZE>
-  inspectorProxyOpRecordList;
+// Completed generic event record for Group/Api/KernelLaunch/NetPlugin events.
+struct inspectorCompletedGenericEventInfo {
+  uint64_t type;              // ncclProfileGroup, ncclProfileGroupApi, etc.
+  uint64_t tsStartUsec;
+  uint64_t tsStopUsec;
+  int rank;
+  // Descriptor-specific fields (type determines validity)
+  char funcName[64];          // CollApi/P2pApi: collective function name
+  size_t count;               // CollApi/P2pApi: element count
+  char datatype[32];          // CollApi/P2pApi: datatype string
+  int root;                   // CollApi: root rank
+  int groupDepth;             // GroupApi: group depth
+  bool graphCaptured;         // GroupApi/CollApi/P2pApi: CUDA graph captured
+  int64_t netPluginId;        // NetPlugin: plugin event id
+};
 
 // Unified record stored in the completed ring buffer for both collective and
-// P2P operations.  The isP2p discriminator selects which op-type-specific
-// fields (algo/proto vs peer) are valid.
+// P2P operations.
 struct inspectorCompletedOpInfo {
   bool isP2p;
   ncclFunc_t func;
@@ -234,8 +239,6 @@ enum {
 };
 
 struct inspectorCommInfo {
-  struct inspectorCommInfo* next;
-
   const char* commName;
   char commNameStr[NCCL_COMM_NAME_MAX];
   uint64_t commHash;
@@ -249,9 +252,11 @@ struct inspectorCommInfo {
   bool dump_coll;
   bool dump_p2p;
   bool dump_proxy;
-  struct inspectorCompletedRing completedCollRing;
-  struct inspectorCompletedRing completedP2pRing;
-  struct inspectorCompletedRing completedProxyRing;
+  bool dump_generic;
+  FixedRingBuffer<inspectorCompletedOpInfo> completedCollRing;
+  FixedRingBuffer<inspectorCompletedOpInfo> completedP2pRing;
+  FixedRingBuffer<inspectorCompletedProxyEventInfo> completedProxyRing;
+  FixedRingBuffer<inspectorCompletedGenericEventInfo> completedGenericRing;
   uint64_t p2pSeqNum;
   uint64_t proxySeqNum;
   pthread_rwlock_t guard;
@@ -259,7 +264,6 @@ struct inspectorCommInfo {
 
 // Structure to track flush times and file handles per device UUID
 struct deviceFlushInfo {
-  char deviceUuidStr[37];
   uint64_t lastFlushTime;
   FILE* fileHandle;           // Open file handle for this device
   bool needsCreation;         // Whether file needs to be created/flushed
@@ -272,7 +276,7 @@ struct inspectorDumpThread {
   jsonFileOutput* jfo;
   char* outputRoot;
   int64_t sampleIntervalUsecs;
-  std::vector<deviceFlushInfo> deviceFlushEntries;
+  std::unordered_map<std::string, deviceFlushInfo> deviceFlushMap;
   pthread_t pthread;
   pthread_rwlock_t guard;
 
@@ -325,7 +329,6 @@ struct inspectorCollInfo {
   uint32_t nKernelChCompleted;
   uint32_t nProxyOpsStarted;
   uint32_t nProxyOpsCompleted;
-  pthread_rwlock_t guard;
   struct inspectorKernelChInfo kernelCh[MAX_CHANNELS];
   struct inspectorEventTrkOpInfo collEvtTrk;
   inspectorProxyOpRecordList proxyOps;
@@ -347,7 +350,6 @@ struct inspectorP2pInfo {
   uint32_t nKernelChCompleted;
   uint32_t nProxyOpsStarted;
   uint32_t nProxyOpsCompleted;
-  pthread_rwlock_t guard;
   struct inspectorKernelChInfo kernelCh[MAX_CHANNELS];
   struct inspectorEventTrkOpInfo p2pEvtTrk;
   inspectorProxyOpRecordList proxyOps;
@@ -375,7 +377,6 @@ struct inspectorProxyOpInfo {
   uint64_t tsCompletedUsec;
   inspectorProxyEventStateList states;
   inspectorProxyStepRecordList steps;
-  pthread_rwlock_t guard;
 };
 
 struct inspectorProxyStepInfo {
@@ -390,7 +391,6 @@ struct inspectorProxyStepInfo {
   uint64_t tsStartUsec;
   uint64_t tsCompletedUsec;
   inspectorProxyEventStateList states;
-  pthread_rwlock_t guard;
 };
 
 struct inspectorProxyCtrlInfo {
@@ -400,12 +400,10 @@ struct inspectorProxyCtrlInfo {
   uint64_t tsStartUsec;
   uint64_t tsCompletedUsec;
   inspectorProxyEventStateList states;
-  pthread_rwlock_t guard;
 };
 
 struct inspectorCommInfoList {
-  struct inspectorCommInfo* comms;
-  uint32_t ncomms;
+  std::vector<inspectorCommInfo*> comms;
   pthread_rwlock_t guard;
 };
 
@@ -459,26 +457,10 @@ extern bool enableNcclInspectorP2p;
 // Global flag to control proxy event tracking
 extern bool enableNcclInspectorProxy;
 extern bool requireKernelTiming;
-// Minimum message size (bytes) to be `tracked by inspector
+// Minimum message size (bytes) to be tracked by inspector
 extern size_t ncclInspectorDumpMinSizeBytes;
 
 bool inspectorIsDumpVerboseEnabled();
-
-inspectorResult_t inspectorCompletedProxyEventInfoCopy(void* dst,
-                                                       const void* src);
-inspectorResult_t inspectorCompletedProxyEventInfoMove(void* dst,
-                                                       const void* src);
-void inspectorCompletedProxyEventInfoCleanup(void* entry);
-inspectorResult_t inspectorCompletedOpInfoCopy(void* dst, const void* src);
-inspectorResult_t inspectorCompletedOpInfoMove(void* dst, const void* src);
-void inspectorCompletedOpInfoCleanup(void* entry);
-inspectorResult_t inspectorProxyOpRecordListAppend(
-    inspectorProxyOpRecordList* list,
-    const struct inspectorCompletedProxyEventInfo* record);
-inspectorResult_t inspectorProxyOpRecordListCopy(
-    inspectorProxyOpRecordList* dst,
-    const inspectorProxyOpRecordList* src);
-void inspectorProxyOpRecordListCleanup(inspectorProxyOpRecordList* proxyOps);
 
 const char* inspectorErrorString(inspectorResult_t result);
 

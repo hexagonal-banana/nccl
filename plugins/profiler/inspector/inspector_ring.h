@@ -1,132 +1,85 @@
 #ifndef INSPECTOR_INSPECTOR_RING_H_
 #define INSPECTOR_INSPECTOR_RING_H_
 
-#include <stddef.h>
 #include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
 #include <vector>
-
-// Forward declaration — inspectorResult_t has a fixed underlying type so it
-// can be declared here without pulling in inspector.h (which would be circular,
-// since inspector.h includes this header for inspectorCompletedRing).
-enum inspectorResult_t : int;
-
-typedef inspectorResult_t (*inspectorRingEntryCopyFn)(void* dst,
-                                                      const void* src);
-typedef void (*inspectorRingEntryDestroyFn)(void* entry);
-
-// Generic fixed-size ring buffer (used for both coll and P2P completed entries).
-// Defined here rather than in inspector.h to keep ring logic self-contained;
-// inspector.h includes this header so inspectorCommInfo can embed the struct.
-//
-// Uses Sentinel Approach (never-full) - one sentinel slot is allocated beyond 'size' so
-// that empty (head==tail) and full ((tail+1)%(size+1)==head) are always
-// distinguishable without a separate count field.
-// Empty : head == tail
-// Full  : (tail + 1) % (size + 1) == head  — overwrite oldest on enqueue
-struct inspectorCompletedRing {
-  void* entries{nullptr};
-  size_t entrySize{0};  // size of each entry in bytes
-  uint32_t size{0};     // user-visible capacity (size+1 slots are allocated)
-  uint32_t head{0};     // index of oldest element
-  uint32_t tail{0};     // index where next element will be written
-  inspectorRingEntryCopyFn copyEntry{nullptr};
-  inspectorRingEntryDestroyFn destroyEntry{nullptr};
-};
+#include <utility>
 
 /*
- * Description:
- *   Returns a pointer to the entry at index idx in the ring's backing store.
+ * Typed fixed-size ring buffer with overwrite-on-full semantics.
  *
- *   Because entries is void* (the ring is shared by coll and P2P), array
- *   subscript notation is not available. This helper centralises the byte-offset
- *   arithmetic (idx * entrySize) so no call site needs to spell it out.
+ * Uses the sentinel approach: allocates size+1 slots so that
+ * empty (head==tail) and full ((tail+1)%(size+1)==head) are always
+ * distinguishable without a separate count field.
  *
- * Parameters:
- *   ring - ring buffer whose backing store is accessed.
- *   idx  - slot index (must be < ring->size).
- *
- * Return:
- *   void* - pointer to the entry at the given slot.
- */
-static inline void* ringSlot(const struct inspectorCompletedRing* ring, uint32_t idx) {
-  return (char*)ring->entries + idx * ring->entrySize;
-}
-
-// Returns true when the ring contains at least one entry.
-static inline bool inspectorRingNonEmpty(const struct inspectorCompletedRing* ring) {
-  return ring->head != ring->tail;
-}
-
-// Generic ring operations
-inspectorResult_t inspectorRingInit(struct inspectorCompletedRing* ring,
-                                    uint32_t size,
-                                    size_t entrySize);
-inspectorResult_t inspectorRingInitWithCallbacks(struct inspectorCompletedRing* ring,
-                                                 uint32_t size,
-                                                 size_t entrySize,
-                                                 inspectorRingEntryCopyFn copyEntry,
-                                                 inspectorRingEntryDestroyFn destroyEntry);
-void inspectorRingFinalize(struct inspectorCompletedRing* ring);
-inspectorResult_t inspectorRingEnqueue(struct inspectorCompletedRing* ring,
-                                       const void* entry);
-
-/*
- * Description:
- *   Drains all entries from the ring buffer into a typed scratch vector.
- *
- *   Templated so it works for any entry type without requiring this header
- *   to include inspector.h (which would be circular). The caller's vector
- *   type T must match the entry type the ring was initialised with.
- *
- *   Non-dependent names in the template body cannot use inspectorSuccess /
- *   inspectorMemoryError by name (two-phase lookup resolves them at definition
- *   time, before inspector.h is seen). Integer literals are used instead, with
- *   the enum's fixed underlying type making the conversion well-defined.
- *
- * Thread Safety:
- *   Not thread-safe (caller must provide synchronization).
- *
- * Parameters:
- *   ring    - ring buffer to drain.
- *   scratch - output vector; cleared and filled with copies of ring entries.
- *
- * Return:
- *   inspectorResult_t{0} (inspectorSuccess)     on success.
- *   inspectorResult_t{2} (inspectorMemoryError) if ring is null.
+ * Elements are moved in/out via std::move. No function pointers for
+ * copy/destroy — the element type's move constructor/destructor handles
+ * resource management automatically (RAII).
  */
 template<typename T>
-inspectorResult_t inspectorRingDrain(struct inspectorCompletedRing* ring,
-                                     std::vector<T>& scratch) {
-  scratch.clear();
-  if (!ring) return static_cast<inspectorResult_t>(2); // inspectorMemoryError
-  if (ring->head != ring->tail && ring->size > 0 && ring->entries) {
-    uint32_t bufSize = ring->size + 1;
-    uint32_t count   = (ring->tail + bufSize - ring->head) % bufSize;
-    for (uint32_t i = 0; i < count; i++) {
-      uint32_t idx = (ring->head + i) % bufSize;
-      void* src = ringSlot(ring, idx);
-      if (ring->copyEntry) {
-        T item;
-        memset(&item, 0, sizeof(item));
-        inspectorResult_t res = ring->copyEntry(&item, src);
-        if (res != static_cast<inspectorResult_t>(0)) return res;
-        scratch.push_back(item);
-      } else {
-        scratch.push_back(*static_cast<T*>(src));
-      }
-    }
-    if (ring->destroyEntry) {
-      for (uint32_t i = 0; i < count; i++) {
-        uint32_t idx = (ring->head + i) % bufSize;
-        ring->destroyEntry(ringSlot(ring, idx));
-      }
-    }
-    ring->head = 0;
-    ring->tail = 0;
+class FixedRingBuffer {
+ public:
+  FixedRingBuffer() = default;
+
+  explicit FixedRingBuffer(uint32_t capacity)
+    : buf_(capacity + 1), size_(capacity) {}
+
+  // Deferred initialization (for default-constructed instances)
+  void init(uint32_t capacity) {
+    buf_.resize(capacity + 1);
+    size_ = capacity;
+    head_ = 0;
+    tail_ = 0;
   }
-  return static_cast<inspectorResult_t>(0); // inspectorSuccess
-}
+
+  // Move-enqueue an element. Overwrites the oldest entry if the ring is full.
+  void enqueue(T&& item) {
+    if (size_ == 0) return;
+    uint32_t bufSize = size_ + 1;
+    if ((tail_ + 1) % bufSize == head_) {
+      // Ring full: discard oldest by advancing head
+      buf_[head_] = T{};  // reset oldest slot
+      head_ = (head_ + 1) % bufSize;
+    }
+    buf_[tail_] = std::move(item);
+    tail_ = (tail_ + 1) % bufSize;
+  }
+
+  // Drain all entries from the ring, returning them as a vector via move.
+  // The ring is left empty after this call.
+  std::vector<T> drain() {
+    std::vector<T> result;
+    if (size_ == 0 || head_ == tail_) return result;
+
+    uint32_t bufSize = size_ + 1;
+    uint32_t count = (tail_ + bufSize - head_) % bufSize;
+    result.reserve(count);
+
+    for (uint32_t i = 0; i < count; i++) {
+      uint32_t idx = (head_ + i) % bufSize;
+      result.push_back(std::move(buf_[idx]));
+    }
+    head_ = 0;
+    tail_ = 0;
+    return result;
+  }
+
+  bool nonEmpty() const { return head_ != tail_; }
+
+  uint32_t capacity() const { return size_; }
+
+  // Clear and release backing storage
+  void finalize() {
+    buf_.clear();
+    buf_.shrink_to_fit();
+    head_ = tail_ = size_ = 0;
+  }
+
+ private:
+  std::vector<T> buf_;
+  uint32_t head_{0};
+  uint32_t tail_{0};
+  uint32_t size_{0};
+};
 
 #endif  // INSPECTOR_INSPECTOR_RING_H_

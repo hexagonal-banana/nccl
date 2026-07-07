@@ -10,8 +10,6 @@
 #include "inspector_prom.h"
 #include "inspector_json.h"
 #include "inspector_cudawrap.h"
-#include "inspector_ring.h"
-#include "inspector_event_pool.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -287,17 +285,16 @@ inspectorResult_t inspectorUnlockRWLock(pthread_rwlock_t* lockRef) {
 inspectorState g_state;
 
 static inspectorResult_t inspectorCommInfoListInit(struct inspectorCommInfoList* commList) {
-  if (commList->comms) {
+  if (!commList->comms.empty()) {
     return inspectorGlobalInitError;
   }
-  commList->comms = nullptr;
-  commList->ncomms = 0;
+  commList->comms.clear();
   INS_CHK(inspectorLockInit(&commList->guard));
   return inspectorSuccess;
 }
 
 static inspectorResult_t inspectorGlobalStateInit() {
-  memset(&g_state, 0, sizeof(struct inspectorState));
+  g_state = inspectorState{};
   INS_CHK(inspectorCommInfoListInit(&g_state.liveComms));
   INS_CHK(inspectorCommInfoListInit(&g_state.deletedComms));
   return inspectorSuccess;
@@ -372,20 +369,18 @@ const char* inspectorTimingSourceToString(inspectorTimingSource_t timingSource) 
  *
  */
 inspectorResult_t inspectorCommInfoListFinalize(struct inspectorCommInfoList* commList) {
-  struct inspectorCommInfo* nextComm = nullptr;
   INS_CHK(inspectorLockWr(&commList->guard));
-  while (commList->comms != nullptr && commList->ncomms != 0) {
+  for (auto* comm : commList->comms) {
     TRACE_INSPECTOR("NCCL Inspector: comm %lu still in tracker",
-                    commList->comms->commHash);
-    nextComm = commList->comms->next;
-    inspectorRingFinalize(&commList->comms->completedCollRing);
-    inspectorRingFinalize(&commList->comms->completedP2pRing);
-    inspectorRingFinalize(&commList->comms->completedProxyRing);
-    INS_CHK(inspectorLockDestroy(&commList->comms->guard));
-    free(commList->comms);
-    commList->comms = nextComm;
-    commList->ncomms--;
+                    comm->commHash);
+    comm->completedCollRing.finalize();
+    comm->completedP2pRing.finalize();
+    comm->completedProxyRing.finalize();
+    comm->completedGenericRing.finalize();
+    inspectorLockDestroy(&comm->guard);
+    delete comm;
   }
+  commList->comms.clear();
   INS_CHK(inspectorUnlockRWLock(&commList->guard));
   return inspectorSuccess;
 }
@@ -503,22 +498,22 @@ inspectorDumpThread::~inspectorDumpThread() {
   // Close and cleanup Prometheus files, only in Prom mode
   if (enableNcclInspectorPromDump) {
     // Close any open Prometheus file handles
-    for (size_t i = 0; i < deviceFlushEntries.size(); i++) {
-      if (deviceFlushEntries[i].fileHandle) {
-        fclose(deviceFlushEntries[i].fileHandle);
-        deviceFlushEntries[i].fileHandle = NULL;
+    for (auto& entry : deviceFlushMap) {
+      if (entry.second.fileHandle) {
+        fclose(entry.second.fileHandle);
+        entry.second.fileHandle = NULL;
       }
     }
 
     // Cleanup (delete) prom files after closing them
-    for (size_t i = 0; i < deviceFlushEntries.size(); i++) {
-      if (deviceFlushEntries[i].filename[0] != '\0') {
-        if (unlink(deviceFlushEntries[i].filename) == 0) {
+    for (auto& entry : deviceFlushMap) {
+      if (entry.second.filename[0] != '\0') {
+        if (unlink(entry.second.filename) == 0) {
           TRACE_INSPECTOR("NCCL Inspector: Cleaned up Prometheus file %s",
-                          deviceFlushEntries[i].filename);
+                          entry.second.filename);
         } else {
           INFO_INSPECTOR("NCCL Inspector: Failed to cleanup Prometheus file %s: %s",
-                         deviceFlushEntries[i].filename, strerror(errno));
+                         entry.second.filename, strerror(errno));
         }
       }
     }
@@ -541,51 +536,41 @@ inspectorDumpThread::~inspectorDumpThread() {
 FILE* inspectorDumpThread::getOrCreateFileHandle(const char* deviceUuidStr,
                                                  const char* filename,
                                                  uint64_t currentTime) {
-  int flushIndex = -1;
   bool needsFlush = false;
+  std::string key(deviceUuidStr);
 
-  // Find existing entry for this device UUID
-  for (size_t i = 0; i < deviceFlushEntries.size(); i++) {
-    if (strncmp(deviceFlushEntries[i].deviceUuidStr,
-                deviceUuidStr,
-                sizeof(deviceFlushEntries[i].deviceUuidStr) - 1) == 0) {
-      flushIndex = static_cast<int>(i);
-
-      // Check if we need to flush (clear) the file
-      if (sampleIntervalUsecs > 0 &&
-          (deviceFlushEntries[i].lastFlushTime == 0
-           || ((currentTime - deviceFlushEntries[i].lastFlushTime)
-               >= (uint64_t)sampleIntervalUsecs))) {
-        needsFlush = true;
-      }
-      break;
+  auto it = deviceFlushMap.find(key);
+  if (it != deviceFlushMap.end()) {
+    // Check if we need to flush (clear) the file
+    if (sampleIntervalUsecs > 0 &&
+        (it->second.lastFlushTime == 0
+         || ((currentTime - it->second.lastFlushTime)
+             >= (uint64_t)sampleIntervalUsecs))) {
+      needsFlush = true;
     }
-  }
-
-  // If not found, add new entry
-  if (flushIndex == -1) {
-    deviceFlushInfo newEntry;
-    strncpy(newEntry.deviceUuidStr, deviceUuidStr, sizeof(newEntry.deviceUuidStr));
-    newEntry.deviceUuidStr[sizeof(newEntry.deviceUuidStr) - 1] = '\0';
+  } else {
+    // Not found, add new entry
+    deviceFlushInfo newEntry{};
     strncpy(newEntry.filename, filename, sizeof(newEntry.filename) - 1);
     newEntry.filename[sizeof(newEntry.filename) - 1] = '\0';
     newEntry.lastFlushTime = 0;
     newEntry.fileHandle = NULL;
     newEntry.needsCreation = true;
-
-    deviceFlushEntries.push_back(newEntry);
-    flushIndex = static_cast<int>(deviceFlushEntries.size() - 1);
+    auto result = deviceFlushMap.emplace(key, newEntry);
+    it = result.first;
     needsFlush = true;
   }
 
+  deviceFlushInfo& entry = it->second;
+
   // Close existing handle if we need to flush (recreate file)
-  if (needsFlush && deviceFlushEntries[flushIndex].fileHandle) {
-    fclose(deviceFlushEntries[flushIndex].fileHandle);
-    deviceFlushEntries[flushIndex].fileHandle = NULL;
+  if (needsFlush && entry.fileHandle) {
+    fclose(entry.fileHandle);
+    entry.fileHandle = NULL;
   }
 
   // Open/create file if needed
-  if (!deviceFlushEntries[flushIndex].fileHandle) {
+  if (!entry.fileHandle) {
     // Create file if flushing, otherwise append
     const char* mode = needsFlush ? "w" : "a";
     FILE* file = fopen(filename, mode);
@@ -597,15 +582,15 @@ FILE* inspectorDumpThread::getOrCreateFileHandle(const char* deviceUuidStr,
 
     chmod(filename, 0777);
 
-    deviceFlushEntries[flushIndex].fileHandle = file;
+    entry.fileHandle = file;
 
     if (needsFlush) {
       TRACE_INSPECTOR("NCCL Inspector: Created/flushed Prometheus file %s", filename);
-      deviceFlushEntries[flushIndex].lastFlushTime = currentTime;
+      entry.lastFlushTime = currentTime;
     }
   }
 
-  return deviceFlushEntries[flushIndex].fileHandle;
+  return entry.fileHandle;
 }
 
 void inspectorDumpThread::startThread() {
@@ -668,7 +653,7 @@ inspectorResult_t inspectorDumpThread::inspectorStateDumpJSON(const char* output
     inspectorCommInfoListDump(jfo, &g_state.deletedComms);
   }
 
-  if (g_state.deletedComms.ncomms > 0) {
+  if (g_state.deletedComms.comms.size() > 0) {
     inspectorCommInfoListFinalize(&g_state.deletedComms);
   }
   return inspectorSuccess;
@@ -688,7 +673,7 @@ inspectorResult_t inspectorDumpThread::inspectorStateDumpProm(const char* output
   }
 
   // Finalize deleted communicators
-  if (g_state.deletedComms.ncomms > 0) {
+  if (g_state.deletedComms.comms.size() > 0) {
     inspectorCommInfoListFinalize(&g_state.deletedComms);
   }
 
@@ -849,8 +834,7 @@ static void showInspectorEnvVars() {
     {"NCCL_INSPECTOR_PROXY_CTRL_POOL_SIZE", getenv("NCCL_INSPECTOR_PROXY_CTRL_POOL_SIZE"), "1024", "Proxy ctrl pool initial size/stride"},
     {"NCCL_INSPECTOR_POOL_GROW", getenv("NCCL_INSPECTOR_POOL_GROW"), "1", "Enable/disable dynamic growth of event pools"},
     {"NCCL_INSPECTOR_REQUIRE_KERNEL_TIMING", getenv("NCCL_INSPECTOR_REQUIRE_KERNEL_TIMING"), "1", "Require GPU-based kernel timing; discard events with CPU-measured timing"},
-    {"NCCL_INSPECTOR_ASYNC_ENABLE", getenv("NCCL_INSPECTOR_ASYNC_ENABLE"), "1", "Enable async producer/consumer event processing"},
-    {"NCCL_INSPECTOR_ASYNC_QUEUE_SIZE", getenv("NCCL_INSPECTOR_ASYNC_QUEUE_SIZE"), "1048576", "Async event queue capacity"},
+    {"NCCL_INSPECTOR_ASYNC_QUEUE_SIZE", getenv("NCCL_INSPECTOR_ASYNC_QUEUE_SIZE"), "1048576", "Async event queue capacity (async is always enabled)"},
     {"NCCL_INSPECTOR_PROXY_MIN_MSG_SIZE", getenv("NCCL_INSPECTOR_PROXY_MIN_MSG_SIZE"), "16777216", "Minimum message size (bytes) for proxy event tracking"},
   };
 
@@ -864,39 +848,6 @@ static void showInspectorEnvVars() {
             envVars[i].value ? "" : ", default=",
             envVars[i].value ? "" : envVars[i].defaultVal);
   }
-}
-
-/*
- * Description:
- *   Helper function to read pool size from environment variable with
- *   validation.
- *
- * Parameters:
- *   envVarName  - Name of the environment variable to read.
- *   description - Description of the pool (for logging).
- *   defaultSize - Default size if environment variable is not set.
- *   minSize     - Minimum allowed size.
- *
- * Return:
- *   uint32_t - The validated pool size (>= minSize).
- */
-static uint32_t getPoolSizeFromEnv(const char* envVarName,
-                                   const char* description,
-                                   uint32_t defaultSize,
-                                   uint32_t minSize) {
-  const char* str = getenv(envVarName);
-  uint64_t poolSize = str ? strtoull(str, 0, 0) : defaultSize;
-  if (poolSize < minSize) {
-    INFO_INSPECTOR("NCCL Inspector: %s %lu too small, using minimum of %u",
-                   description, poolSize, minSize);
-    poolSize = minSize;
-  }
-  if (poolSize > UINT32_MAX) {
-    INFO_INSPECTOR("NCCL Inspector: %s %lu too large, using maximum of %u",
-                   description, poolSize, UINT32_MAX);
-    poolSize = UINT32_MAX;
-  }
-  return (uint32_t)poolSize;
 }
 
 /*
@@ -967,33 +918,15 @@ static void initKernelTimingFromEnv() {
  * Description:
  *
  *   Initializes event pools using sizes from environment variables.
+ *   NOTE: Pool initialization is now handled in inspector_plugin.cc.
+ *   This function is retained as a no-op stub for compatibility.
  *
  * Return:
- *   inspectorResult_t - Result from inspectorEventPoolInit.
+ *   inspectorResult_t - always inspectorSuccess.
  */
 static inspectorResult_t inspectorEventPoolInitFromEnv() {
-  uint32_t collPoolSize
-    = getPoolSizeFromEnv("NCCL_INSPECTOR_COLL_POOL_SIZE",
-                         "Collective pool size", 256, 10);
-  uint32_t p2pPoolSize
-    = getPoolSizeFromEnv("NCCL_INSPECTOR_P2P_POOL_SIZE",
-                         "P2P pool size", 256, 10);
-  uint32_t commPoolSize
-    = getPoolSizeFromEnv("NCCL_INSPECTOR_COMM_POOL_SIZE",
-                         "Comm pool size", 256, 10);
-  uint32_t proxyOpPoolSize
-    = getPoolSizeFromEnv("NCCL_INSPECTOR_PROXY_OP_POOL_SIZE",
-                         "Proxy op pool size", 1024, 16);
-  uint32_t proxyStepPoolSize
-    = getPoolSizeFromEnv("NCCL_INSPECTOR_PROXY_STEP_POOL_SIZE",
-                         "Proxy step pool size", 8192, 16);
-  uint32_t proxyCtrlPoolSize
-    = getPoolSizeFromEnv("NCCL_INSPECTOR_PROXY_CTRL_POOL_SIZE",
-                         "Proxy ctrl pool size", 1024, 16);
-
-  return inspectorEventPoolInit(collPoolSize, p2pPoolSize, commPoolSize,
-                                proxyOpPoolSize, proxyStepPoolSize,
-                                proxyCtrlPoolSize);
+  // Pools are now initialized in inspectorPluginInit (inspector_plugin.cc)
+  return inspectorSuccess;
 }
 
 /*
@@ -1257,23 +1190,13 @@ static inspectorResult_t inspectorFillCommInfo(struct inspectorCommInfo* commInf
   commInfo->dump_coll = false;
   commInfo->dump_p2p = false;
   commInfo->dump_proxy = false;
+  commInfo->dump_generic = false;
   commInfo->p2pSeqNum = 0;
   commInfo->proxySeqNum = 0;
-  INS_CHK(inspectorRingInitWithCallbacks(&commInfo->completedCollRing,
-                                         ncclInspectorDumpCollRingSize,
-                                         sizeof(struct inspectorCompletedOpInfo),
-                                         inspectorCompletedOpInfoMove,
-                                         inspectorCompletedOpInfoCleanup));
-  INS_CHK(inspectorRingInitWithCallbacks(&commInfo->completedP2pRing,
-                                         ncclInspectorDumpP2pRingSize,
-                                         sizeof(struct inspectorCompletedOpInfo),
-                                         inspectorCompletedOpInfoMove,
-                                         inspectorCompletedOpInfoCleanup));
-  INS_CHK(inspectorRingInitWithCallbacks(&commInfo->completedProxyRing,
-                                         ncclInspectorDumpProxyRingSize,
-                                         sizeof(struct inspectorCompletedProxyEventInfo),
-                                         inspectorCompletedProxyEventInfoMove,
-                                         inspectorCompletedProxyEventInfoCleanup));
+  commInfo->completedCollRing.init(ncclInspectorDumpCollRingSize);
+  commInfo->completedP2pRing.init(ncclInspectorDumpP2pRingSize);
+  commInfo->completedProxyRing.init(ncclInspectorDumpProxyRingSize);
+  commInfo->completedGenericRing.init(4096);
 
   // Capture current CUDA device ID and convert to UUID string
   int cudaDeviceId = -1;
@@ -1314,7 +1237,6 @@ static inspectorResult_t inspectorFillCommInfo(struct inspectorCommInfo* commInf
            (unsigned char)deviceUuid.bytes[14], (unsigned char)deviceUuid.bytes[15]);
 
   INS_CHK(inspectorLockInit(&commInfo->guard));
-  commInfo->next = nullptr;
 
   return inspectorSuccess;
 }
@@ -1356,9 +1278,7 @@ inspectorResult_t inspectorAddComm(struct inspectorCommInfo **commInfo,
   bool locked = false;
   INSPECTOR_LOCK_RD_FLAG(&liveCommInfoList->guard, locked,
                          "inspectorAddComm: commList::guard -rd");
-  for (struct inspectorCommInfo* itr = liveCommInfoList->comms;
-       itr != nullptr;
-       itr = itr->next) {
+  for (auto* itr : liveCommInfoList->comms) {
     if (comm_eq(commHash, itr->commHash, rank, itr->rank)) {
       INFO_INSPECTOR("NCCL Inspector: comm 0x%lx already in tracker",
                      commHash);
@@ -1368,9 +1288,8 @@ inspectorResult_t inspectorAddComm(struct inspectorCommInfo **commInfo,
   }
   INSPECTOR_UNLOCK_RW_LOCK_FLAG(&liveCommInfoList->guard, locked,
                                 "inspectorAddComm: commList::guard");
-  commInfoPtr
-    = (struct inspectorCommInfo*)calloc(1, sizeof(struct inspectorCommInfo));
-  if (0 == commInfoPtr) {
+  commInfoPtr = new (std::nothrow) inspectorCommInfo{};
+  if (commInfoPtr == nullptr) {
     res = inspectorMemoryError;
     goto exit;
   }
@@ -1384,9 +1303,7 @@ inspectorResult_t inspectorAddComm(struct inspectorCommInfo **commInfo,
 
   INSPECTOR_LOCK_WR_FLAG(&liveCommInfoList->guard, locked,
                          "inspectorAddComm: commList::guard -wr");
-  ++liveCommInfoList->ncomms;
-  commInfoPtr->next = liveCommInfoList->comms;
-  liveCommInfoList->comms = commInfoPtr;
+  liveCommInfoList->comms.push_back(commInfoPtr);
 
 exit:
   INSPECTOR_UNLOCK_RW_LOCK_FLAG(&liveCommInfoList->guard, locked,
@@ -1395,7 +1312,7 @@ exit:
   return res;
 fail:
   if (commInfoPtr) {
-    free(commInfoPtr);
+    delete commInfoPtr;
     commInfoPtr = nullptr;
   }
   goto exit;
@@ -1430,18 +1347,13 @@ inspectorResult_t inspectorDelComm(struct inspectorCommInfo *commInfo) {
 
   INSPECTOR_LOCK_WR_FLAG(&liveCommInfoList->guard, locked,
                          "inspectorDelComm: liveCommInfoList::guard -wr");
-  struct inspectorCommInfo** prev_ptr = &liveCommInfoList->comms;
-  for (struct inspectorCommInfo* itr = liveCommInfoList->comms;
-       itr != nullptr;
-       itr = itr->next) {
-    if (comm_eq(commInfo->commHash, itr->commHash, commInfo->rank, itr->rank)) {
-      *prev_ptr = itr->next;
-      liveCommInfoList->ncomms--;
-
-      commInfoPtr = itr;
+  for (auto it = liveCommInfoList->comms.begin();
+       it != liveCommInfoList->comms.end(); ++it) {
+    if (comm_eq(commInfo->commHash, (*it)->commHash, commInfo->rank, (*it)->rank)) {
+      commInfoPtr = *it;
+      liveCommInfoList->comms.erase(it);
       break;
     }
-    prev_ptr = &itr->next;
   }
   INSPECTOR_UNLOCK_RW_LOCK_FLAG(&liveCommInfoList->guard, locked,
                                 "inspectorDelComm: liveCommInfoList::guard -unlock");
@@ -1454,9 +1366,7 @@ inspectorResult_t inspectorDelComm(struct inspectorCommInfo *commInfo) {
 
   INSPECTOR_LOCK_WR_FLAG(&deletedCommInfoList->guard, locked,
                          "inspectorDelComm: deletedCommInfoList::guard -wr");
-  commInfoPtr->next = deletedCommInfoList->comms;
-  deletedCommInfoList->comms = commInfoPtr;
-  deletedCommInfoList->ncomms++;
+  deletedCommInfoList->comms.push_back(commInfoPtr);
   INSPECTOR_UNLOCK_RW_LOCK_FLAG(&deletedCommInfoList->guard, locked,
                                 "inspectorDelComm: deletedCommInfoList::guard -unlock");
 
@@ -1644,7 +1554,7 @@ static uint64_t calculateMaxKernelExecTimeUsecs(struct inspectorCollInfo *collIn
  */
 void inspectorUpdateCollPerf(struct inspectorCompletedOpInfo *completedOp,
                              struct inspectorCollInfo *collInfo) {
-  memset(completedOp, 0, sizeof(*completedOp));
+  *completedOp = inspectorCompletedOpInfo{};
   completedOp->isP2p = false;
   completedOp->func = ncclStringToFunc(collInfo->func);
   completedOp->sn = collInfo->sn;
@@ -1655,7 +1565,7 @@ void inspectorUpdateCollPerf(struct inspectorCompletedOpInfo *completedOp,
   completedOp->proto = collInfo->proto;
   completedOp->evtTrk = collInfo->collEvtTrk;
   // Move ownership: collInfo->proxyOps will be cleaned up after this
-  inspectorInlineListMove(&completedOp->proxyOps, &collInfo->proxyOps);
+  completedOp->proxyOps = std::move(collInfo->proxyOps);
 }
 
 /*
@@ -1728,7 +1638,7 @@ static uint64_t calculateMaxKernelExecTimeUsecsP2p(struct inspectorP2pInfo *p2pI
 
 void inspectorUpdateP2pPerf(struct inspectorCompletedOpInfo *completedOp,
                             struct inspectorP2pInfo *p2pInfo) {
-  memset(completedOp, 0, sizeof(*completedOp));
+  *completedOp = inspectorCompletedOpInfo{};
   completedOp->isP2p = true;
   completedOp->func = ncclStringToFunc(p2pInfo->func);
   completedOp->sn = p2pInfo->sn;
@@ -1738,7 +1648,7 @@ void inspectorUpdateP2pPerf(struct inspectorCompletedOpInfo *completedOp,
     calculateMaxKernelExecTimeUsecsP2p(p2pInfo, &completedOp->timingSource);
   completedOp->evtTrk = p2pInfo->p2pEvtTrk;
   // Move ownership: p2pInfo->proxyOps will be cleaned up after this
-  inspectorInlineListMove(&completedOp->proxyOps, &p2pInfo->proxyOps);
+  completedOp->proxyOps = std::move(p2pInfo->proxyOps);
 }
 
 /*
@@ -1783,7 +1693,5 @@ inspectorResult_t inspectorGlobalFinalize() {
   }
   inspectorCommInfoListFinalize(&g_state.liveComms);
   inspectorCommInfoListFinalize(&g_state.deletedComms);
-  // Finalize event pools
-  inspectorEventPoolFinalize();
   return inspectorSuccess;
 }

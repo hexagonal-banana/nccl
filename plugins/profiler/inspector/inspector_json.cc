@@ -1,9 +1,20 @@
 #include "inspector_json.h"
-#include "inspector_ring.h"
 #include "profiler.h"
 
 #include <unistd.h>
 #include <vector>
+
+static const char* inspectorGenericEventTypeToStringJson(uint64_t type) {
+  switch (type) {
+  case ncclProfileGroup:        return "Group";
+  case ncclProfileGroupApi:     return "GroupApi";
+  case ncclProfileCollApi:      return "CollApi";
+  case ncclProfileP2pApi:       return "P2pApi";
+  case ncclProfileKernelLaunch: return "KernelLaunch";
+  case ncclProfileNetPlugin:    return "NetPlugin";
+  default:                      return "Unknown";
+  }
+}
 
 #define JSON_CHK(expr)                                          \
   do {                                                          \
@@ -25,9 +36,6 @@
     } while (0)
 
 static void inspectorCompletedOpVectorCleanup(std::vector<inspectorCompletedOpInfo>& ops) {
-  for (size_t i = 0; i < ops.size(); i++) {
-    inspectorCompletedOpInfoCleanup(&ops[i]);
-  }
   ops.clear();
 }
 
@@ -272,10 +280,9 @@ static const char* inspectorProxyDirectionToString(int isSend) {
 static inline inspectorResult_t inspectorProxyStateList(jsonFileOutput* jfo,
                                                         const inspectorProxyEventStateList* states) {
   JSON_CHK(jsonStartList(jfo));
-  uint32_t count = states ? states->count : 0;
+  uint32_t count = states ? static_cast<uint32_t>(states->size()) : 0;
   for (uint32_t i = 0; i < count; i++) {
-    const struct inspectorProxyEventStateInfo* state =
-      inspectorInlineListGet(states, i);
+    const struct inspectorProxyEventStateInfo* state = &(*states)[i];
     if (state == nullptr) return inspectorMemoryError;
 
     JSON_CHK(jsonStartObject(jfo));
@@ -319,10 +326,9 @@ static inline inspectorResult_t inspectorProxyStepRecord(jsonFileOutput* jfo,
 static inline inspectorResult_t inspectorProxyStepList(jsonFileOutput* jfo,
                                                        const inspectorProxyStepRecordList* steps) {
   JSON_CHK(jsonStartList(jfo));
-  uint32_t count = steps ? steps->count : 0;
+  uint32_t count = steps ? static_cast<uint32_t>(steps->size()) : 0;
   for (uint32_t i = 0; i < count; i++) {
-    const struct inspectorProxyStepRecordInfo* step =
-      inspectorInlineListGet(steps, i);
+    const struct inspectorProxyStepRecordInfo* step = &(*steps)[i];
     INS_CHK(inspectorProxyStepRecord(jfo, step));
   }
   JSON_CHK(jsonFinishList(jfo));
@@ -369,8 +375,8 @@ static inline inspectorResult_t inspectorCompletedProxy(jsonFileOutput* jfo,
 
     if (proxy->proxyType == inspectorProxyEventTypeOp) {
       JSON_CHK(jsonKey(jfo, "proxy_step_count"));
-      JSON_CHK(jsonUint64(jfo, proxy->steps.count));
-      JSON_CHK(jsonKey(jfo, "events"));
+      JSON_CHK(jsonUint64(jfo, proxy->steps.size()));
+      JSON_CHK(jsonKey(jfo, "proxy_step_records"));
       INS_CHK(inspectorProxyStepList(jfo, &proxy->steps));
     }
   }
@@ -417,10 +423,9 @@ static inline inspectorResult_t inspectorCompletedOpChildEventList(
     INS_CHK(inspectorCompletedKernelCh(jfo, op, ch));
   }
 
-  uint32_t count = op->proxyOps.count;
+  uint32_t count = static_cast<uint32_t>(op->proxyOps.size());
   for (uint32_t i = 0; i < count; i++) {
-    const struct inspectorCompletedProxyEventInfo* proxy =
-      inspectorInlineListGet(&op->proxyOps, i);
+    const struct inspectorCompletedProxyEventInfo* proxy = &op->proxyOps[i];
     if (proxy == nullptr) return inspectorMemoryError;
     INS_CHK(inspectorCompletedProxy(jfo, proxy));
   }
@@ -461,14 +466,8 @@ static inspectorResult_t inspectorCommInfoDumpColl(jsonFileOutput* jfo,
 
   inspectorLockWr(&commInfo->guard);
   if (commInfo->dump_coll) {
-    // Make sure we won't allocate while draining (steady-state: no-op).
-    if (commInfo->completedCollRing.size > 0
-        && drainedColl.capacity() < commInfo->completedCollRing.size) {
-      drainedColl.reserve(commInfo->completedCollRing.size);
-    }
-    INS_CHK(inspectorRingDrain<inspectorCompletedOpInfo>(&commInfo->completedCollRing,
-                                                         drainedColl));
-    commInfo->dump_coll = inspectorRingNonEmpty(&commInfo->completedCollRing);
+    drainedColl = commInfo->completedCollRing.drain();
+    commInfo->dump_coll = commInfo->completedCollRing.nonEmpty();
   }
   inspectorUnlockRWLock(&commInfo->guard);
 
@@ -508,13 +507,8 @@ static inspectorResult_t inspectorCommInfoDumpP2p(jsonFileOutput* jfo,
 
   inspectorLockWr(&commInfo->guard);
   if (commInfo->dump_p2p) {
-    if (commInfo->completedP2pRing.size > 0
-        && drainedP2p.capacity() < commInfo->completedP2pRing.size) {
-      drainedP2p.reserve(commInfo->completedP2pRing.size);
-    }
-    INS_CHK(inspectorRingDrain<inspectorCompletedOpInfo>(&commInfo->completedP2pRing,
-                                                        drainedP2p));
-    commInfo->dump_p2p = inspectorRingNonEmpty(&commInfo->completedP2pRing);
+    drainedP2p = commInfo->completedP2pRing.drain();
+    commInfo->dump_p2p = commInfo->completedP2pRing.nonEmpty();
   }
   inspectorUnlockRWLock(&commInfo->guard);
 
@@ -558,13 +552,8 @@ static inspectorResult_t inspectorCommInfoDumpProxy(jsonFileOutput* jfo,
 
   inspectorLockWr(&commInfo->guard);
   if (commInfo->dump_proxy) {
-    if (commInfo->completedProxyRing.size > 0
-        && drainedProxy.capacity() < commInfo->completedProxyRing.size) {
-      drainedProxy.reserve(commInfo->completedProxyRing.size);
-    }
-    res = inspectorRingDrain<inspectorCompletedProxyEventInfo>(&commInfo->completedProxyRing,
-                                                               drainedProxy);
-    commInfo->dump_proxy = inspectorRingNonEmpty(&commInfo->completedProxyRing);
+    drainedProxy = commInfo->completedProxyRing.drain();
+    commInfo->dump_proxy = commInfo->completedProxyRing.nonEmpty();
   }
   inspectorUnlockRWLock(&commInfo->guard);
   if (res != inspectorSuccess) goto cleanup;
@@ -596,10 +585,90 @@ cleanup:
   if (outputLocked) {
     jsonUnlockOutput(jfo);
   }
-  for (size_t i = 0; i < drainedProxy.size(); i++) {
-    inspectorCompletedProxyEventInfoCleanup(&drainedProxy[i]);
-  }
+  // std::vector destructor handles cleanup
   return res;
+}
+
+static inspectorResult_t inspectorCommInfoDumpGeneric(jsonFileOutput* jfo,
+                                                      inspectorCommInfo* commInfo,
+                                                      bool* needs_writing) {
+  if (commInfo == nullptr) {
+    return inspectorSuccess;
+  }
+
+  std::vector<inspectorCompletedGenericEventInfo> drainedGeneric;
+
+  inspectorLockWr(&commInfo->guard);
+  if (commInfo->dump_generic) {
+    drainedGeneric = commInfo->completedGenericRing.drain();
+    commInfo->dump_generic = commInfo->completedGenericRing.nonEmpty();
+  }
+  inspectorUnlockRWLock(&commInfo->guard);
+
+  if (!drainedGeneric.empty()) {
+    *needs_writing = true;
+    JSON_CHK(jsonLockOutput(jfo));
+    for (size_t i = 0; i < drainedGeneric.size(); i++) {
+      const struct inspectorCompletedGenericEventInfo* evt = &drainedGeneric[i];
+      JSON_CHK(jsonStartObject(jfo));
+      {
+        JSON_CHK(jsonKey(jfo, "header"));
+        inspectorCommInfoHeader(jfo, commInfo);
+
+        JSON_CHK(jsonKey(jfo, "metadata"));
+        inspectorCommInfoMetaHeader(jfo);
+
+        JSON_CHK(jsonKey(jfo, "generic_event"));
+        JSON_CHK(jsonStartObject(jfo));
+        {
+          JSON_CHK(jsonKey(jfo, "event_type"));
+          JSON_CHK(jsonStr(jfo, inspectorGenericEventTypeToStringJson(evt->type)));
+
+          JSON_CHK(jsonKey(jfo, "start_ts"));
+          JSON_CHK(jsonUint64(jfo, evt->tsStartUsec));
+
+          JSON_CHK(jsonKey(jfo, "stop_ts"));
+          JSON_CHK(jsonUint64(jfo, evt->tsStopUsec));
+
+          uint64_t durationUsec =
+            (evt->tsStopUsec >= evt->tsStartUsec) ?
+            (evt->tsStopUsec - evt->tsStartUsec) : 0;
+          JSON_CHK(jsonKey(jfo, "duration_us"));
+          JSON_CHK(jsonUint64(jfo, durationUsec));
+
+          JSON_CHK(jsonKey(jfo, "rank"));
+          JSON_CHK(jsonInt(jfo, evt->rank));
+
+          // Type-specific fields
+          if (evt->type == ncclProfileCollApi || evt->type == ncclProfileP2pApi) {
+            if (evt->funcName[0] != '\0') {
+              JSON_CHK(jsonKey(jfo, "func")); JSON_CHK(jsonStr(jfo, evt->funcName));
+            }
+            JSON_CHK(jsonKey(jfo, "count")); JSON_CHK(jsonUint64(jfo, evt->count));
+            if (evt->datatype[0] != '\0') {
+              JSON_CHK(jsonKey(jfo, "datatype")); JSON_CHK(jsonStr(jfo, evt->datatype));
+            }
+            JSON_CHK(jsonKey(jfo, "graph_captured")); JSON_CHK(jsonBool(jfo, evt->graphCaptured));
+          }
+          if (evt->type == ncclProfileCollApi) {
+            JSON_CHK(jsonKey(jfo, "root")); JSON_CHK(jsonInt(jfo, evt->root));
+          }
+          if (evt->type == ncclProfileGroupApi) {
+            JSON_CHK(jsonKey(jfo, "group_depth")); JSON_CHK(jsonInt(jfo, evt->groupDepth));
+            JSON_CHK(jsonKey(jfo, "graph_captured")); JSON_CHK(jsonBool(jfo, evt->graphCaptured));
+          }
+          if (evt->type == ncclProfileNetPlugin) {
+            JSON_CHK(jsonKey(jfo, "net_plugin_id")); JSON_CHK(jsonUint64(jfo, (uint64_t)evt->netPluginId));
+          }
+        }
+        JSON_CHK(jsonFinishObject(jfo));
+      }
+      JSON_CHK(jsonFinishObject(jfo));
+      JSON_CHK(jsonNewline(jfo));
+    }
+    JSON_CHK(jsonUnlockOutput(jfo));
+  }
+  return inspectorSuccess;
 }
 
 static inspectorResult_t inspectorCommInfoDump(jsonFileOutput* jfo,
@@ -610,6 +679,7 @@ static inspectorResult_t inspectorCommInfoDump(jsonFileOutput* jfo,
   INS_CHK(inspectorCommInfoDumpColl(jfo, commInfo, needs_writing));
   INS_CHK(inspectorCommInfoDumpP2p(jfo, commInfo, needs_writing));
   INS_CHK(inspectorCommInfoDumpProxy(jfo, commInfo, needs_writing));
+  INS_CHK(inspectorCommInfoDumpGeneric(jfo, commInfo, needs_writing));
   return inspectorSuccess;
 }
 
@@ -642,10 +712,8 @@ inspectorResult_t inspectorCommInfoListDump(jsonFileOutput* jfo,
   bool flush = false;
   INS_CHK(inspectorLockRd(&commList->guard));
   inspectorResult_t res = inspectorSuccess;
-  if (commList->ncomms > 0) {
-    for (struct inspectorCommInfo* itr = commList->comms;
-         itr != nullptr;
-         itr = itr->next) {
+  if (!commList->comms.empty()) {
+    for (auto* itr : commList->comms) {
       bool needs_writing;
       INS_CHK_GOTO(inspectorCommInfoDump(jfo, itr, &needs_writing),
                    res, exit);

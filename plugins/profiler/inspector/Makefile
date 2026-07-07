@@ -65,8 +65,6 @@ SRCS := inspector.cc \
 	inspector_prom.cc \
 	inspector_plugin.cc \
 	inspector_cudawrap.cc \
-	inspector_ring.cc \
-	inspector_event_pool.cc \
 	json.cc \
 	version.cc
 
