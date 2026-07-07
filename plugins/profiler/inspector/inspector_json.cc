@@ -4,15 +4,24 @@
 #include <unistd.h>
 #include <vector>
 
-static const char* inspectorSimpleEventTypeToStringJson(uint64_t type) {
+static const char* inspectorSimpleEventTypeToKeyJson(uint64_t type) {
   switch (type) {
-  case ncclProfileGroup:        return "Group";
-  case ncclProfileGroupApi:     return "GroupApi";
-  case ncclProfileCollApi:      return "CollApi";
-  case ncclProfileP2pApi:       return "P2pApi";
-  case ncclProfileKernelLaunch: return "KernelLaunch";
-  case ncclProfileNetPlugin:    return "NetPlugin";
-  default:                      return "Unknown";
+  case ncclProfileGroup:        return "group";
+  case ncclProfileGroupApi:     return "group_api";
+  case ncclProfileCollApi:      return "coll_api";
+  case ncclProfileP2pApi:       return "p2p_api";
+  case ncclProfileKernelLaunch: return "kernel_launch";
+  case ncclProfileNetPlugin:    return "net_plugin";
+  default:                      return "unknown";
+  }
+}
+
+static const char* inspectorProxyEventTypeToKeyJson(inspectorProxyEventType_t type) {
+  switch (type) {
+  case inspectorProxyEventTypeOp:   return "proxy_op";
+  case inspectorProxyEventTypeStep: return "proxy_step";
+  case inspectorProxyEventTypeCtrl: return "proxy_ctrl";
+  default:                          return "unknown";
   }
 }
 
@@ -571,7 +580,7 @@ static inspectorResult_t inspectorCommInfoDumpProxy(jsonFileOutput* jfo,
         JSON_CHK_GOTO(jsonKey(jfo, "metadata"), res, cleanup);
         INS_CHK_GOTO(inspectorCommInfoMetaHeader(jfo), res, cleanup);
 
-        JSON_CHK_GOTO(jsonKey(jfo, "proxy_event"), res, cleanup);
+        JSON_CHK_GOTO(jsonKey(jfo, inspectorProxyEventTypeToKeyJson(drainedProxy[i].proxyType)), res, cleanup);
         INS_CHK_GOTO(inspectorCompletedProxy(jfo, &drainedProxy[i]), res, cleanup);
       }
       JSON_CHK_GOTO(jsonFinishObject(jfo), res, cleanup);
@@ -618,12 +627,9 @@ static inspectorResult_t inspectorCommInfoDumpSimple(jsonFileOutput* jfo,
         JSON_CHK(jsonKey(jfo, "metadata"));
         inspectorCommInfoMetaHeader(jfo);
 
-        JSON_CHK(jsonKey(jfo, "simple_event"));
+        JSON_CHK(jsonKey(jfo, inspectorSimpleEventTypeToKeyJson(evt->type)));
         JSON_CHK(jsonStartObject(jfo));
         {
-          JSON_CHK(jsonKey(jfo, "event_type"));
-          JSON_CHK(jsonStr(jfo, inspectorSimpleEventTypeToStringJson(evt->type)));
-
           JSON_CHK(jsonKey(jfo, "start_ts"));
           JSON_CHK(jsonUint64(jfo, evt->tsStartUsec));
 
