@@ -376,7 +376,7 @@ inspectorResult_t inspectorCommInfoListFinalize(struct inspectorCommInfoList* co
     comm->completedCollRing.finalize();
     comm->completedP2pRing.finalize();
     comm->completedProxyRing.finalize();
-    comm->completedGenericRing.finalize();
+    comm->completedSimpleRing.finalize();
     inspectorLockDestroy(&comm->guard);
     delete comm;
   }
@@ -1190,13 +1190,13 @@ static inspectorResult_t inspectorFillCommInfo(struct inspectorCommInfo* commInf
   commInfo->dump_coll = false;
   commInfo->dump_p2p = false;
   commInfo->dump_proxy = false;
-  commInfo->dump_generic = false;
+  commInfo->dump_simple = false;
   commInfo->p2pSeqNum = 0;
   commInfo->proxySeqNum = 0;
   commInfo->completedCollRing.init(ncclInspectorDumpCollRingSize);
   commInfo->completedP2pRing.init(ncclInspectorDumpP2pRingSize);
   commInfo->completedProxyRing.init(ncclInspectorDumpProxyRingSize);
-  commInfo->completedGenericRing.init(4096);
+  commInfo->completedSimpleRing.init(4096);
 
   // Capture current CUDA device ID and convert to UUID string
   int cudaDeviceId = -1;

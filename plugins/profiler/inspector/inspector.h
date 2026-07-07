@@ -197,8 +197,8 @@ struct inspectorCompletedProxyEventInfo {
   inspectorProxyStepRecordList steps;
 };
 
-// Completed generic event record for Group/Api/KernelLaunch/NetPlugin events.
-struct inspectorCompletedGenericEventInfo {
+// Completed simple event record for Group/Api/KernelLaunch/NetPlugin events.
+struct inspectorCompletedSimpleEventInfo {
   uint64_t type;              // ncclProfileGroup, ncclProfileGroupApi, etc.
   uint64_t tsStartUsec;
   uint64_t tsStopUsec;
@@ -211,6 +211,22 @@ struct inspectorCompletedGenericEventInfo {
   int groupDepth;             // GroupApi: group depth
   bool graphCaptured;         // GroupApi/CollApi/P2pApi: CUDA graph captured
   int64_t netPluginId;        // NetPlugin: plugin event id
+};
+
+// In-flight event info for Group/Api/KernelLaunch/NetPlugin events (start -> stop lifecycle).
+struct inspectorSimpleEventInfo {
+  uint64_t type;              // First field - used for type dispatch in stop/record
+  uint64_t tsStartUsec;
+  uint64_t tsStopUsec;
+  struct inspectorCommInfo *commInfo;
+  int rank;
+  char funcName[64];          // CollApi/P2pApi: func name
+  size_t count;               // CollApi/P2pApi: element count
+  char datatype[32];          // CollApi/P2pApi: datatype
+  int root;                   // CollApi: root rank
+  int groupDepth;             // GroupApi: group depth
+  bool graphCaptured;         // GroupApi/CollApi/P2pApi: CUDA graph captured
+  int64_t netPluginId;        // NetPlugin: id
 };
 
 // Unified record stored in the completed ring buffer for both collective and
@@ -252,11 +268,11 @@ struct inspectorCommInfo {
   bool dump_coll;
   bool dump_p2p;
   bool dump_proxy;
-  bool dump_generic;
+  bool dump_simple;
   FixedRingBuffer<inspectorCompletedOpInfo> completedCollRing;
   FixedRingBuffer<inspectorCompletedOpInfo> completedP2pRing;
   FixedRingBuffer<inspectorCompletedProxyEventInfo> completedProxyRing;
-  FixedRingBuffer<inspectorCompletedGenericEventInfo> completedGenericRing;
+  FixedRingBuffer<inspectorCompletedSimpleEventInfo> completedSimpleRing;
   uint64_t p2pSeqNum;
   uint64_t proxySeqNum;
   pthread_rwlock_t guard;

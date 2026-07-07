@@ -4,7 +4,7 @@
 #include <unistd.h>
 #include <vector>
 
-static const char* inspectorGenericEventTypeToStringJson(uint64_t type) {
+static const char* inspectorSimpleEventTypeToStringJson(uint64_t type) {
   switch (type) {
   case ncclProfileGroup:        return "Group";
   case ncclProfileGroupApi:     return "GroupApi";
@@ -589,27 +589,27 @@ cleanup:
   return res;
 }
 
-static inspectorResult_t inspectorCommInfoDumpGeneric(jsonFileOutput* jfo,
+static inspectorResult_t inspectorCommInfoDumpSimple(jsonFileOutput* jfo,
                                                       inspectorCommInfo* commInfo,
                                                       bool* needs_writing) {
   if (commInfo == nullptr) {
     return inspectorSuccess;
   }
 
-  std::vector<inspectorCompletedGenericEventInfo> drainedGeneric;
+  std::vector<inspectorCompletedSimpleEventInfo> drainedSimple;
 
   inspectorLockWr(&commInfo->guard);
-  if (commInfo->dump_generic) {
-    drainedGeneric = commInfo->completedGenericRing.drain();
-    commInfo->dump_generic = commInfo->completedGenericRing.nonEmpty();
+  if (commInfo->dump_simple) {
+    drainedSimple = commInfo->completedSimpleRing.drain();
+    commInfo->dump_simple = commInfo->completedSimpleRing.nonEmpty();
   }
   inspectorUnlockRWLock(&commInfo->guard);
 
-  if (!drainedGeneric.empty()) {
+  if (!drainedSimple.empty()) {
     *needs_writing = true;
     JSON_CHK(jsonLockOutput(jfo));
-    for (size_t i = 0; i < drainedGeneric.size(); i++) {
-      const struct inspectorCompletedGenericEventInfo* evt = &drainedGeneric[i];
+    for (size_t i = 0; i < drainedSimple.size(); i++) {
+      const struct inspectorCompletedSimpleEventInfo* evt = &drainedSimple[i];
       JSON_CHK(jsonStartObject(jfo));
       {
         JSON_CHK(jsonKey(jfo, "header"));
@@ -618,11 +618,11 @@ static inspectorResult_t inspectorCommInfoDumpGeneric(jsonFileOutput* jfo,
         JSON_CHK(jsonKey(jfo, "metadata"));
         inspectorCommInfoMetaHeader(jfo);
 
-        JSON_CHK(jsonKey(jfo, "generic_event"));
+        JSON_CHK(jsonKey(jfo, "simple_event"));
         JSON_CHK(jsonStartObject(jfo));
         {
           JSON_CHK(jsonKey(jfo, "event_type"));
-          JSON_CHK(jsonStr(jfo, inspectorGenericEventTypeToStringJson(evt->type)));
+          JSON_CHK(jsonStr(jfo, inspectorSimpleEventTypeToStringJson(evt->type)));
 
           JSON_CHK(jsonKey(jfo, "start_ts"));
           JSON_CHK(jsonUint64(jfo, evt->tsStartUsec));
@@ -679,7 +679,7 @@ static inspectorResult_t inspectorCommInfoDump(jsonFileOutput* jfo,
   INS_CHK(inspectorCommInfoDumpColl(jfo, commInfo, needs_writing));
   INS_CHK(inspectorCommInfoDumpP2p(jfo, commInfo, needs_writing));
   INS_CHK(inspectorCommInfoDumpProxy(jfo, commInfo, needs_writing));
-  INS_CHK(inspectorCommInfoDumpGeneric(jfo, commInfo, needs_writing));
+  INS_CHK(inspectorCommInfoDumpSimple(jfo, commInfo, needs_writing));
   return inspectorSuccess;
 }
 
